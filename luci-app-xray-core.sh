@@ -236,9 +236,6 @@ function index()
 end
 EOF
 
-echo "===> Create LuCI CBI model directory if it does not exist"
-mkdir -p /usr/lib/lua/luci/model/cbi/
-
 echo "===> Create and write LuCI CBI model file /usr/lib/lua/luci/model/cbi/xray.lua"
 cat << 'EOF' > /usr/lib/lua/luci/model/cbi/xray.lua
 local fs = require "nixio.fs"
@@ -270,12 +267,20 @@ asset_dir.description = "geoip.dat and geosite.dat path"
 local conf = s:taboption("config", TextValue, "_conf")
 conf.wrap = "off"
 conf.rows = 30
-conf.cfgvalue = function(section)
+
+-- Исправлена сигнатура: self, section
+conf.cfgvalue = function(self, section)
     return fs.readfile("/etc/xray/config.json") or "{}"
 end
-conf.write = function(section, value)
-    value = value:gsub("\r\n", "\n")
-    fs.writefile("/etc/xray/config.json", value)
+
+-- Исправлена сигнатура: self, section, value
+conf.write = function(self, section, value)
+    if value then
+        value = value:gsub("\r\n", "\n")
+        fs.writefile("/etc/xray/config.json", value)
+        -- Перезапускаем сервис для применения нового конфига
+        sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+    end
 end
 
 return m
