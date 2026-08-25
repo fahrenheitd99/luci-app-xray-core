@@ -1,5 +1,7 @@
 # LuCI App for Xray Core
-
+---
+* This project is not a full-featured multi-protocol proxy client. It is simply a lightweight visual GUI wrapper and management overlay built directly on top of the xray-core daemon.
+---
 ## ❗ Requirements:
 * 256MB of RAM or higher
 * **OpenWRT 25.X.X**
