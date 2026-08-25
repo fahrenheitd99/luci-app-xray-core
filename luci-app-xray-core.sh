@@ -12,9 +12,9 @@ echo "==========> https://github.com/XTLS/Xray-core <=> https://github.com/fahre
 
 echo "===> Xray backend setup initialization..."
 printf "geosite.dat URL (if skip, just press Enter): "
-read GEOSITE_URL
+read GEOSITE_URL < /dev/tty
 printf "geoip.dat URL (if skip, just press Enter): "
-read GEOIP_URL
+read GEOIP_URL < /dev/tty
 
 echo "===> Updating package lists..."
 apk update
