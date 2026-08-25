@@ -18,9 +18,12 @@
 
 ## ⚡ Quick Start:
 ```Shell
-wget -O install.sh "https://raw.githubusercontent.com/fahrenheitd99/luci-app-xray-core/main/luci-app-xray-core.sh" && chmod +x install.sh && ./install.sh
+wget -qO- https://raw.githubusercontent.com/fahrenheitd99/luci-app-xray-core/main/install.sh | sh
 ```
-*After installation you can delete the **install.sh** script if you want to*
+## 🟥 Quick Delete:
+```Shell
+wget -qO- https://raw.githubusercontent.com/fahrenheitd99/luci-app-xray-core/main/delete.sh | sh
+```
 
 ---
 
