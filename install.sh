@@ -1563,10 +1563,10 @@ elseif cmd == "fetch" then
         end
     end
 
-    -- Формат 2: Прямой список vless:// или Base64 (в т.ч. Base64-обёртка вокруг JSON)
+-- Формат 2: Прямой список URI-ссылок (любые протоколы) или Base64 (в т.ч. Base64-обёртка вокруг JSON)
     if #new_nodes == 0 then
         local source_text = content
-        if not content:match("vless://") then
+        if not content:match("[%a][%w%+%-%.]*://") then
             local decoded = decode_base64_str(content)
             if decoded and #decoded > 0 then
                 source_text = decoded
@@ -1582,6 +1582,20 @@ elseif cmd == "fetch" then
                 end
             end
         end
+
+        if #new_nodes == 0 then
+            for line in source_text:gmatch("[^\r\n]+") do
+                local clean_line = line:gsub("^%s+", ""):gsub("%s+$", "")
+                if clean_line:match("^[%a][%w%+%-%.]*://") then
+                    local p = parse_any_link(clean_line)
+                    if p then
+                        sanitize_outbound(p.outbound, p.name)
+                        table.insert(new_nodes, p)
+                    end
+                end
+            end
+        end
+    end
 
         if #new_nodes == 0 then
             for line in source_text:gmatch("[^\r\n]+") do
