@@ -7609,6 +7609,12 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
 echo "===> Service layout & Live Logs update completed! Refresh LuCI."
 
+lua /usr/libexec/xray-ui-core.lua generate
+/etc/init.d/xray restart
+
+echo "===> Clearing LuCI cache..."
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
+
 echo "===> Fixing main Xray PID detection..."
 lua - << 'EOF'
 local fs = require "nixio.fs"
@@ -7628,12 +7634,6 @@ end
 
 assert(loadfile("/usr/lib/lua/luci/controller/xray.lua"), "syntax error in controller/xray.lua")
 EOF
-rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
-
-lua /usr/libexec/xray-ui-core.lua generate
-/etc/init.d/xray restart
-
-echo "===> Clearing LuCI cache..."
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
 echo "===> Setup completed! Refresh your LuCI web interface."
