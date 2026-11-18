@@ -7609,6 +7609,27 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
 echo "===> Service layout & Live Logs update completed! Refresh LuCI."
 
+echo "===> Fixing main Xray PID detection..."
+lua - << 'EOF'
+local fs = require "nixio.fs"
+local pid_expr = [[(sys.exec("ps w | grep '[x]ray run -c /etc/xray/config.json' | awk '{print $1; exit}'") or ""):match("%d+") or ""]]
+
+for _, path in ipairs({
+    "/usr/lib/lua/luci/controller/xray.lua",
+    "/usr/lib/lua/luci/view/xray_status.htm"
+}) do
+    local src = fs.readfile(path)
+    if src then
+        src = src:gsub('sys%.exec%("pidof xray"%):gsub%("%%s%+", ""%)', function() return pid_expr end)
+        src = src:gsub('sys%.call%("pidof xray >/dev/null 2>&1"%) == 0', function() return "(" .. pid_expr .. ") ~= \"\"" end)
+        fs.writefile(path, src)
+    end
+end
+
+assert(loadfile("/usr/lib/lua/luci/controller/xray.lua"), "syntax error in controller/xray.lua")
+EOF
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
+
 lua /usr/libexec/xray-ui-core.lua generate
 /etc/init.d/xray restart
 
