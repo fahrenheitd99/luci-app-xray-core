@@ -1563,7 +1563,7 @@ elseif cmd == "fetch" then
         end
     end
 
--- Формат 2: Прямой список URI-ссылок (любые протоколы) или Base64 (в т.ч. Base64-обёртка вокруг JSON)
+    -- Формат 2: Прямой список URI-ссылок (любые протоколы) или Base64 (в т.ч. Base64-обёртка вокруг JSON)
     if #new_nodes == 0 then
         local source_text = content
         if not content:match("[%a][%w%+%-%.]*://") then
