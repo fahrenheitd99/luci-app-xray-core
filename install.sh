@@ -6046,6 +6046,1529 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
 echo "===> Service tab update completed! Refresh LuCI."
 
+#!/bin/sh
+set -e
+
+echo "===> Initializing logging flags in UCI and setting default loglevel..."
+touch /etc/config/xray_ui
+uci -q get xray_ui.main >/dev/null 2>&1 || uci set xray_ui.main=xray_ui
+uci -q get xray_ui.main.ping_log_enabled >/dev/null 2>&1 || uci set xray_ui.main.ping_log_enabled="0"
+uci -q get xray_ui.main.xray_log_enabled >/dev/null 2>&1 || uci set xray_ui.main.xray_log_enabled="0"
+uci commit xray_ui
+
+lua -e '
+local fs = require "nixio.fs"
+local json = require "luci.jsonc"
+local sys = require "luci.sys"
+local cfg_path = "/etc/xray/config.json"
+local en = (sys.exec("uci -q get xray_ui.main.xray_log_enabled") or "0"):gsub("%s+", "")
+local raw = fs.readfile(cfg_path)
+if raw and raw ~= "" then
+    local cfg = json.parse(raw)
+    if type(cfg) == "table" then
+        if type(cfg.log) ~= "table" then cfg.log = {} end
+        cfg.log.loglevel = (en == "1") and "info" or "error"
+        fs.writefile(cfg_path, json.stringify(cfg, true):gsub("\\/", "/"))
+    end
+end
+'
+
+echo "===> Patching /usr/libexec/xray-ui-core.lua (respect ping_log_enabled flag)..."
+cp /usr/libexec/xray-ui-core.lua /tmp/xray-ui-core.lua.bak
+lua -e '
+local fs = require "nixio.fs"
+local path = "/usr/libexec/xray-ui-core.lua"
+local src = fs.readfile(path)
+assert(src, "cannot read " .. path)
+
+if not src:find("ping_log_enabled", 1, true) then
+    local anchor = "local function append_ping_log(line)\n"
+    local s, e = src:find(anchor, 1, true)
+    assert(s, "append_ping_log anchor not found")
+    local inject = anchor .. "    if (sys.exec(\"uci -q get xray_ui.main.ping_log_enabled\") or \"0\"):gsub(\"%s+\", \"\") ~= \"1\" then return end\n"
+    src = src:sub(1, s - 1) .. inject .. src:sub(e + 1)
+end
+
+fs.writefile(path, src)
+assert(loadfile(path), "syntax check failed for " .. path)
+' || {
+    mv /tmp/xray-ui-core.lua.bak /usr/libexec/xray-ui-core.lua
+    echo "===> Error patching xray-ui-core.lua, restored backup."
+    exit 1
+}
+rm -f /tmp/xray-ui-core.lua.bak
+
+echo "===> Updating /usr/lib/lua/luci/controller/xray.lua..."
+cat << 'EOF' > /usr/lib/lua/luci/controller/xray.lua
+module("luci.controller.xray", package.seeall)
+
+function index()
+    entry({"admin", "services", "xray"}, cbi("xray"), _("Xray Core"), 50).dependent = true
+    entry({"admin", "services", "xray", "api"}, call("action_api")).leaf = true
+    entry({"admin", "services", "xray", "fetch_sub"}, call("action_fetch_sub")).leaf = true
+    entry({"admin", "services", "xray", "add_node"}, call("action_add_node")).leaf = true
+    entry({"admin", "services", "xray", "ping"}, call("action_ping")).leaf = true
+    entry({"admin", "services", "xray", "ping_log"}, call("action_ping_log")).leaf = true
+    entry({"admin", "services", "xray", "xray_log"}, call("action_xray_log")).leaf = true
+    entry({"admin", "services", "xray", "service_ctl"}, call("action_service_ctl")).leaf = true
+    entry({"admin", "services", "xray", "get_config"}, call("action_get_config")).leaf = true
+    entry({"admin", "services", "xray", "geo_list"}, call("action_geo_list")).leaf = true
+    entry({"admin", "services", "xray", "geo_download"}, call("action_geo_download")).leaf = true
+    entry({"admin", "services", "xray", "service_ext"}, call("action_service_ext")).leaf = true
+end
+
+local fs = require "nixio.fs"
+local nixio = require "nixio"
+local sys = require "luci.sys"
+local http = require "luci.http"
+local json = require "luci.jsonc"
+
+local db_path = "/etc/xray/nodes.json"
+local cfg_path = "/etc/xray/config.json"
+local ping_log_path = "/tmp/xray_ping.log"
+local cron_cfg_path = "/etc/xray/cron.json"
+local crontab_path = "/etc/crontabs/root"
+
+local INTERVAL_MAP = {
+    ["1h"]  = "0 * * * *",
+    ["3h"]  = "0 */3 * * *",
+    ["6h"]  = "0 */6 * * *",
+    ["12h"] = "0 */12 * * *",
+    ["1d"]  = "0 4 * * *",
+    ["3d"]  = "0 4 */3 * *",
+    ["7d"]  = "0 4 * * 1",
+    ["14d"] = "0 4 1,15 * *",
+    ["30d"] = "0 4 1 * *"
+}
+
+local function get_asset_dir()
+    local d = (sys.exec("uci -q get xray_ui.main.asset_dir") or "/usr/bin/"):gsub("%s+", "")
+    if d == "" then d = "/usr/bin/" end
+    if d:sub(-1) ~= "/" then d = d .. "/" end
+    return d
+end
+
+local function is_safe_dirpath(dir)
+    if type(dir) ~= "string" or dir == "" then return false end
+    if dir:sub(1, 1) ~= "/" then return false end
+    if dir:find("..", 1, true) then return false end
+    return dir:match("^/[%w%/%._%-]*$") ~= nil
+end
+
+local function list_dat_files(dir)
+    local files = {}
+    local iter = fs.dir(dir)
+    if iter then
+        for name in iter do
+            if name:lower():match("%.dat$") then
+                local st = fs.stat(dir .. name)
+                if st and st.type == "reg" then
+                    table.insert(files, {
+                        name = name,
+                        size = st.size or 0,
+                        mtime = st.mtime or 0
+                    })
+                end
+            end
+        end
+    end
+    table.sort(files, function(a, b) return a.name < b.name end)
+    return files
+end
+
+local function is_safe_filename(name)
+    if type(name) ~= "string" or name == "" then return false end
+    if name:find("/", 1, true) or name:find("..", 1, true) then return false end
+    return name:match("^[%w%.%-%_]+$") ~= nil
+end
+
+local function is_safe_url(url)
+    if type(url) ~= "string" or url == "" then return false end
+    if not url:match("^https?://") then return false end
+    if url:find("[%s\"'`$;|&<>]") then return false end
+    return true
+end
+
+local function get_service_status()
+    local pid = sys.exec("pidof xray"):gsub("%s+", "")
+    local is_running = (pid ~= "")
+    local is_enabled = (sys.call("/etc/init.d/xray enabled >/dev/null 2>&1") == 0)
+    return {
+        running = is_running,
+        pid = is_running and pid or "-",
+        enabled = is_enabled
+    }
+end
+
+local function default_cron_cfg()
+    return {
+        geo_enabled = false,
+        geofiles = {
+            { enabled = false, url = "", filename = "geosite.dat", interval = "7d" },
+            { enabled = false, url = "", filename = "geoip.dat", interval = "7d" }
+        },
+        restart_enabled = false,
+        restart_interval = "1d"
+    }
+end
+
+local function load_cron_cfg()
+    local raw = fs.readfile(cron_cfg_path)
+    local parsed = raw and json.parse(raw) or nil
+    if type(parsed) ~= "table" then return default_cron_cfg() end
+    if type(parsed.geofiles) ~= "table" then parsed.geofiles = {} end
+    return parsed
+end
+
+local function apply_crontab(cron_cfg)
+    local dir = get_asset_dir()
+    fs.mkdirr("/etc/crontabs")
+    local existing = fs.readfile(crontab_path) or ""
+    local kept = {}
+    local inside = false
+    for line in (existing .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+        if line == "# XRAY_UI_CRON_BEGIN" then
+            inside = true
+        elseif line == "# XRAY_UI_CRON_END" then
+            inside = false
+        elseif not inside then
+            table.insert(kept, line)
+        end
+    end
+    while #kept > 0 and kept[#kept] == "" do
+        table.remove(kept)
+    end
+
+    local jobs = {}
+    if cron_cfg.geo_enabled and type(cron_cfg.geofiles) == "table" then
+        for _, g in ipairs(cron_cfg.geofiles) do
+            if type(g) == "table" and g.enabled then
+                local url = tostring(g.url or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                local fname = tostring(g.filename or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                local sched = INTERVAL_MAP[tostring(g.interval or "")]
+                if sched and is_safe_url(url) and is_safe_filename(fname) then
+                    table.insert(jobs, string.format('%s wget -O "%s%s" "%s"', sched, dir, fname, url))
+                end
+            end
+        end
+    end
+
+    if cron_cfg.restart_enabled then
+        local sched = INTERVAL_MAP[tostring(cron_cfg.restart_interval or "")]
+        if sched then
+            table.insert(jobs, string.format('%s /etc/init.d/xray restart', sched))
+        end
+    end
+
+    if #jobs > 0 then
+        table.insert(kept, "# XRAY_UI_CRON_BEGIN")
+        for _, j in ipairs(jobs) do
+            table.insert(kept, j)
+        end
+        table.insert(kept, "# XRAY_UI_CRON_END")
+    end
+
+    local final_text = (#kept > 0) and (table.concat(kept, "\n") .. "\n") or ""
+    fs.writefile(crontab_path, final_text)
+    sys.call("/etc/init.d/cron enable >/dev/null 2>&1; /etc/init.d/cron restart >/dev/null 2>&1")
+    return #jobs
+end
+
+local function is_xray_log_enabled()
+    local raw = fs.readfile(cfg_path)
+    if raw and raw ~= "" then
+        local cfg = json.parse(raw)
+        if type(cfg) == "table" and type(cfg.log) == "table" and type(cfg.log.loglevel) == "string" then
+            local lv = cfg.log.loglevel:lower()
+            return (lv == "info" or lv == "debug")
+        end
+    end
+    local v = (sys.exec("uci -q get xray_ui.main.xray_log_enabled") or "0"):gsub("%s+", "")
+    return v == "1"
+end
+
+function action_api()
+    local method = http.getenv("REQUEST_METHOD")
+    if method == "GET" then
+        http.prepare_content("application/json")
+        http.write(fs.readfile(db_path) or "{}")
+    elseif method == "POST" then
+        local qs = http.getenv("QUERY_STRING") or ""
+        local norestart = qs:match("norestart=1")
+        local content = http.content()
+        if content and content ~= "" then
+            fs.writefile(db_path, content)
+            if not norestart then
+                sys.call("lua /usr/libexec/xray-ui-core.lua generate >/dev/null 2>&1")
+                sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+            end
+            http.prepare_content("application/json")
+            http.write(json.stringify({
+                status = "ok",
+                service = get_service_status(),
+                config = fs.readfile(cfg_path) or "{}"
+            }))
+        end
+    end
+end
+
+function action_add_node()
+    local link = http.formvalue("link")
+    http.prepare_content("application/json")
+    if not link or link == "" then
+        http.write(json.stringify({ success = false, error = "Link is empty" }))
+        return
+    end
+    local tmp = "/tmp/xray_add_node.tmp"
+    fs.writefile(tmp, link)
+    local res = sys.exec("lua /usr/libexec/xray-ui-core.lua add_node " .. tmp .. " 2>&1")
+    fs.remove(tmp)
+    local parsed = res and json.parse(res)
+    if type(parsed) == "table" and parsed.success ~= nil then
+        http.write(res)
+    else
+        http.write(json.stringify({
+            success = false,
+            error = (res and res ~= "") and res:sub(1, 200) or "Failed to parse node"
+        }))
+    end
+end
+
+function action_ping()
+    local content = http.content()
+    http.prepare_content("application/json")
+    if not content or content == "" then
+        http.write(json.stringify({ success = false, ms = -1, error = "empty request" }))
+        return
+    end
+    local _, u = nixio.gettimeofday()
+    local tmp = string.format("/tmp/xray_ping_req_%d_%d.json", nixio.getpid(), u or 0)
+    fs.writefile(tmp, content)
+    local res = sys.exec("lua /usr/libexec/xray-ui-core.lua ping " .. tmp .. " 2>&1")
+    fs.remove(tmp)
+    local parsed = res and json.parse(res)
+    if type(parsed) == "table" and parsed.success ~= nil then
+        http.write(res)
+    else
+        local err_msg = (res and res ~= "") and res:gsub("%s+", " "):sub(1, 200) or "ping script failed"
+        local plog_en = (sys.exec("uci -q get xray_ui.main.ping_log_enabled") or "0"):gsub("%s+", "")
+        if plog_en == "1" then
+            local cur = fs.readfile(ping_log_path) or ""
+            fs.writefile(ping_log_path, cur .. "[" .. os.date("%H:%M:%S") .. "] [ERR] " .. err_msg .. "\n")
+        end
+        http.write(json.stringify({ success = false, ms = -1, error = err_msg }))
+    end
+end
+
+function action_ping_log()
+    local method = http.getenv("REQUEST_METHOD")
+    if method == "POST" and http.formvalue("clear") == "1" then
+        fs.writefile(ping_log_path, "")
+        http.prepare_content("application/json")
+        http.write('{"ok":true}')
+        return
+    end
+    http.prepare_content("text/plain; charset=utf-8")
+    http.write(fs.readfile(ping_log_path) or "")
+end
+
+function action_xray_log()
+    local out = sys.exec("logread 2>/dev/null | grep -iE 'xray\\[|xray:' | tail -n 200")
+    if not out or out == "" then
+        out = sys.exec("logread -e xray 2>/dev/null | tail -n 200")
+    end
+    http.prepare_content("text/plain; charset=utf-8")
+    http.write(out or "")
+end
+
+function action_fetch_sub()
+    local sub_idx = tonumber(http.formvalue("index"))
+    local res = sys.exec("lua /usr/libexec/xray-ui-core.lua fetch " .. tostring(sub_idx or 0) .. " 2>&1")
+    http.prepare_content("application/json")
+    local parsed = res and json.parse(res)
+    if type(parsed) == "table" and parsed.success ~= nil then
+        http.write(res)
+    else
+        http.write(json.stringify({
+            success = false,
+            error = (res and res ~= "") and res:sub(1, 200) or "Empty output from fetch script"
+        }))
+    end
+end
+
+function action_service_ctl()
+    local act = http.formvalue("action")
+    if act == "start" then sys.call("/etc/init.d/xray start >/dev/null 2>&1")
+    elseif act == "stop" then sys.call("/etc/init.d/xray stop >/dev/null 2>&1")
+    elseif act == "restart" then sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+    elseif act == "enable" then sys.call("/etc/init.d/xray enable >/dev/null 2>&1")
+    elseif act == "disable" then sys.call("/etc/init.d/xray disable >/dev/null 2>&1")
+    end
+    http.prepare_content("application/json")
+    http.write(json.stringify(get_service_status()))
+end
+
+function action_get_config()
+    http.prepare_content("application/json")
+    http.write(json.stringify({
+        service = get_service_status(),
+        config = fs.readfile(cfg_path) or "{}"
+    }))
+end
+
+function action_geo_list()
+    local dir = get_asset_dir()
+    http.prepare_content("application/json")
+    http.write(json.stringify({
+        dir = dir,
+        files = list_dat_files(dir)
+    }))
+end
+
+function action_geo_download()
+    local content = http.content()
+    local req = content and json.parse(content) or nil
+    local dir = get_asset_dir()
+    http.prepare_content("application/json")
+
+    if type(req) ~= "table" then
+        http.write(json.stringify({ success = false, error = "Invalid request" }))
+        return
+    end
+
+    local url = tostring(req.url or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local fname = tostring(req.filename or ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+    if not is_safe_url(url) then
+        http.write(json.stringify({ success = false, error = "Invalid URL (expected http:// or https://)" }))
+        return
+    end
+    if not is_safe_filename(fname) then
+        http.write(json.stringify({ success = false, error = "Invalid filename (use letters, digits, '.', '-', '_')" }))
+        return
+    end
+
+    fs.mkdirr(dir)
+    local dest = dir .. fname
+    local cmd = string.format('wget -O "%s" "%s" 2>&1; printf "\\nRC=%%d" $?', dest, url)
+    local out = sys.exec(cmd) or ""
+    local rc = tonumber(out:match("RC=(%d+)%s*$")) or 1
+    local msg = out:gsub("RC=%d+%s*$", ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+
+    if rc == 0 then
+        http.write(json.stringify({
+            success = true,
+            dir = dir,
+            files = list_dat_files(dir)
+        }))
+    else
+        http.write(json.stringify({
+            success = false,
+            error = (msg ~= "" and msg:sub(-160) or "wget failed (rc=" .. rc .. ")"),
+            dir = dir,
+            files = list_dat_files(dir)
+        }))
+    end
+end
+
+function action_service_ext()
+    local method = http.getenv("REQUEST_METHOD")
+    http.prepare_content("application/json")
+
+    if method == "GET" then
+        local gomem = (sys.exec("uci -q get xray_ui.main.gomemlimit") or "65MiB"):gsub("%s+", "")
+        local gogc = (sys.exec("uci -q get xray_ui.main.gogc") or "40"):gsub("%s+", "")
+        local ping_en = (sys.exec("uci -q get xray_ui.main.ping_log_enabled") or "0"):gsub("%s+", "")
+        if gomem == "" then gomem = "65MiB" end
+        if gogc == "" then gogc = "40" end
+        http.write(json.stringify({
+            asset_dir = get_asset_dir(),
+            cron = load_cron_cfg(),
+            limits = { gomemlimit = gomem, gogc = gogc },
+            logging = {
+                ping_log = (ping_en == "1"),
+                xray_log = is_xray_log_enabled()
+            }
+        }))
+        return
+    end
+
+    local content = http.content()
+    local req = content and json.parse(content) or nil
+    if type(req) ~= "table" then
+        http.write(json.stringify({ success = false, error = "Invalid payload" }))
+        return
+    end
+
+    if req.section == "asset_dir" then
+        local dir = tostring(req.asset_dir or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if not is_safe_dirpath(dir) then
+            http.write(json.stringify({ success = false, error = "Invalid directory path (must start with /)" }))
+            return
+        end
+        if dir:sub(-1) ~= "/" then dir = dir .. "/" end
+        fs.mkdirr(dir)
+        sys.call(string.format("uci set xray_ui.main.asset_dir='%s' && uci commit xray_ui", dir))
+        local cron_cfg = load_cron_cfg()
+        if cron_cfg.geo_enabled then apply_crontab(cron_cfg) end
+        local restarted = false
+        if sys.call("pidof xray >/dev/null 2>&1") == 0 then
+            sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+            restarted = true
+        end
+        http.write(json.stringify({
+            success = true,
+            dir = dir,
+            files = list_dat_files(dir),
+            restarted = restarted,
+            service = get_service_status()
+        }))
+        return
+    end
+
+    if req.section == "cron" and type(req.cron) == "table" then
+        fs.writefile(cron_cfg_path, json.stringify(req.cron, true))
+        local count = apply_crontab(req.cron)
+        http.write(json.stringify({ success = true, jobs = count }))
+        return
+    end
+
+    if req.section == "limits" and type(req.limits) == "table" then
+        local gomem = tostring(req.limits.gomemlimit or ""):gsub("%s+", "")
+        local gogc = tostring(req.limits.gogc or ""):gsub("%s+", "")
+        if gomem == "" or not gomem:match("^[%w]+$") then
+            http.write(json.stringify({ success = false, error = "Invalid GOMEMLIMIT (e.g. 65MiB, 128MiB)" }))
+            return
+        end
+        if gogc == "" or not (gogc:match("^%d+$") or gogc == "off") then
+            http.write(json.stringify({ success = false, error = "Invalid GOGC (integer or 'off')" }))
+            return
+        end
+        sys.call(string.format("uci set xray_ui.main.gomemlimit='%s' && uci set xray_ui.main.gogc='%s' && uci commit xray_ui", gomem, gogc))
+        local restarted = false
+        if sys.call("pidof xray >/dev/null 2>&1") == 0 then
+            sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+            restarted = true
+        end
+        http.write(json.stringify({
+            success = true,
+            restarted = restarted,
+            service = get_service_status()
+        }))
+        return
+    end
+
+    if req.section == "logging" then
+        local restarted = false
+        local new_loglevel = nil
+        if req.ping_log ~= nil then
+            local pv = req.ping_log and "1" or "0"
+            sys.call("uci set xray_ui.main.ping_log_enabled='" .. pv .. "' && uci commit xray_ui")
+        end
+        if req.xray_log ~= nil then
+            local xv = req.xray_log and "1" or "0"
+            new_loglevel = req.xray_log and "info" or "error"
+            sys.call("uci set xray_ui.main.xray_log_enabled='" .. xv .. "' && uci commit xray_ui")
+            local raw_cfg = fs.readfile(cfg_path) or "{}"
+            local cfg = json.parse(raw_cfg)
+            if type(cfg) == "table" then
+                if type(cfg.log) ~= "table" then cfg.log = {} end
+                cfg.log.loglevel = new_loglevel
+                fs.writefile(cfg_path, json.stringify(cfg, true):gsub("\\/", "/"))
+                if sys.call("pidof xray >/dev/null 2>&1") == 0 then
+                    sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+                    restarted = true
+                end
+            end
+        end
+        local ping_en = (sys.exec("uci -q get xray_ui.main.ping_log_enabled") or "0"):gsub("%s+", "")
+        http.write(json.stringify({
+            success = true,
+            ping_log = (ping_en == "1"),
+            xray_log = is_xray_log_enabled(),
+            loglevel = new_loglevel,
+            restarted = restarted,
+            service = get_service_status(),
+            config = fs.readfile(cfg_path) or "{}"
+        }))
+        return
+    end
+
+    http.write(json.stringify({ success = false, error = "Unknown section" }))
+end
+EOF
+
+echo "===> Updating /usr/lib/lua/luci/model/cbi/xray.lua (removing standalone Asset Directory)..."
+cat << 'EOF' > /usr/lib/lua/luci/model/cbi/xray.lua
+local fs = require "nixio.fs"
+local sys = require "luci.sys"
+
+local m = Map("xray_ui", "Xray Core")
+local s = m:section(NamedSection, "main", "xray_ui")
+s.addremove = false
+
+s:tab("service", "Service")
+s:tab("nodes", "Nodes")
+s:tab("subs", "Subscriptions")
+s:tab("rules", "Rules")
+s:tab("config", "Config")
+
+local status = s:taboption("service", DummyValue, "_status")
+status.template = "xray_status"
+
+local service_extra = s:taboption("service", DummyValue, "_service_extra")
+service_extra.template = "xray_service_extra"
+
+local nodes_ui = s:taboption("nodes", DummyValue, "_nodes")
+nodes_ui.template = "xray_nodes"
+
+local subs_ui = s:taboption("subs", DummyValue, "_subs")
+subs_ui.template = "xray_subs"
+
+local rules_ui = s:taboption("rules", DummyValue, "_rules")
+rules_ui.template = "xray_rules"
+
+local conf = s:taboption("config", TextValue, "_conf")
+conf.wrap = "off"
+conf.rows = 30
+conf.description = "Direct editor for /etc/xray/config.json"
+conf.cfgvalue = function(self, section)
+    return fs.readfile("/etc/xray/config.json") or "{}"
+end
+conf.write = function(self, section, value)
+    if value then
+        value = value:gsub("\r\n", "\n")
+        fs.writefile("/etc/xray/config.json", value)
+        sys.call("/etc/init.d/xray restart >/dev/null 2>&1")
+    end
+end
+
+return m
+EOF
+
+echo "===> Updating /usr/lib/lua/luci/view/xray_status.htm (uniform card spacing, move log controls down)..."
+cat << 'EOF' > /usr/lib/lua/luci/view/xray_status.htm
+<%
+    local sys = require "luci.sys"
+    local xray_ver = sys.exec("xray version 2>/dev/null | head -n1 | awk '{print $2}'"):gsub("%s+", "")
+    if xray_ver == "" then xray_ver = "Unknown" end
+
+    local pid = sys.exec("pidof xray"):gsub("%s+", "")
+    local is_running = (pid ~= "")
+    if not is_running then pid = "-" end
+
+    local is_enabled = (sys.call("/etc/init.d/xray enabled >/dev/null 2>&1") == 0)
+%>
+<style>
+    .xr-card {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        padding: 16px;
+        margin: 0 0 12px 0 !important;
+    }
+    .xr-status-line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 18px;
+        align-items: center;
+        margin: 12px 0 18px 0;
+        font-size: 1.02em;
+    }
+    .xr-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 10px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.85em;
+        letter-spacing: 0.4px;
+    }
+    .xr-badge-run { background: rgba(76, 175, 80, 0.18); color: #66bb6a; border: 1px solid rgba(76, 175, 80, 0.4); }
+    .xr-badge-rule { background: rgba(79, 195, 247, 0.16); color: #4fc3f7; border: 1px solid rgba(79, 195, 247, 0.4); }
+    .xr-badge-stop { background: rgba(244, 67, 54, 0.18); color: #ef5350; border: 1px solid rgba(244, 67, 54, 0.4); }
+    .xr-badge-idle { background: rgba(158, 158, 158, 0.15); color: #9e9e9e; border: 1px solid rgba(158, 158, 158, 0.3); }
+    .xr-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .xr-input-row { display: flex; gap: 8px; margin-bottom: 14px; }
+    .xr-input-row input { flex: 1; }
+    .xr-sub-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 10px;
+        margin: 10px 0 14px 0;
+    }
+    .xr-field label { display: block; font-size: 0.8em; opacity: 0.75; margin-bottom: 3px; }
+    .xr-field input, .xr-field select { width: 100%; box-sizing: border-box; }
+    .xr-drag-handle {
+        cursor: grab;
+        user-select: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 4px 6px;
+        opacity: 0.55;
+        transition: opacity 0.15s;
+    }
+    .xr-drag-handle:hover { opacity: 1; }
+    .xr-drag-handle:active { cursor: grabbing; }
+    .xr-row-dragging { opacity: 0.35; }
+    .xr-row-over-top td { border-top: 2px solid #4fc3f7 !important; }
+    .xr-row-over-bottom td { border-bottom: 2px solid #4fc3f7 !important; }
+    .xr-chip {
+        display: inline-block;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 4px;
+        padding: 2px 7px;
+        margin: 2px 4px 2px 0;
+        font-size: 0.84em;
+        font-family: monospace;
+    }
+
+    /* Ping buttons (fixed rectangle size + 3 blinking dots) */
+    .xr-ping-btn {
+        width: 78px !important;
+        min-width: 78px !important;
+        max-width: 78px !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        box-sizing: border-box !important;
+        font-weight: 600 !important;
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        vertical-align: middle;
+        transition: background 0.18s, border-color 0.18s, color 0.18s;
+    }
+    .xr-ping-all-btn {
+        min-width: 82px !important;
+        font-weight: 600 !important;
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.18s, border-color 0.18s, color 0.18s;
+    }
+    .xr-ping-unpinged {
+        background: rgba(0, 195, 255, 0.22) !important;
+        color: #29d9ff !important;
+        border: 1px solid #00c8ff !important;
+    }
+    .xr-ping-unpinged:hover {
+        background: rgba(0, 195, 255, 0.36) !important;
+    }
+    .xr-ping-loading {
+        background: rgba(0, 195, 255, 0.16) !important;
+        color: #29d9ff !important;
+        border: 1px solid #00c8ff !important;
+        cursor: wait !important;
+    }
+    .xr-ping-good {
+        background: rgba(0, 230, 118, 0.22) !important;
+        color: #00e676 !important;
+        border: 1px solid #00e676 !important;
+    }
+    .xr-ping-good:hover { background: rgba(0, 230, 118, 0.34) !important; }
+    .xr-ping-mid {
+        background: rgba(255, 234, 0, 0.22) !important;
+        color: #ffea00 !important;
+        border: 1px solid #ffd600 !important;
+    }
+    .xr-ping-mid:hover { background: rgba(255, 234, 0, 0.34) !important; }
+    .xr-ping-slow {
+        background: rgba(255, 145, 0, 0.24) !important;
+        color: #ff9100 !important;
+        border: 1px solid #ff9100 !important;
+    }
+    .xr-ping-slow:hover { background: rgba(255, 145, 0, 0.36) !important; }
+    .xr-ping-fail {
+        background: rgba(255, 23, 68, 0.22) !important;
+        color: #ff5252 !important;
+        border: 1px solid #ff1744 !important;
+    }
+    .xr-ping-fail:hover { background: rgba(255, 23, 68, 0.34) !important; }
+
+    .xr-ping-dots {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        height: 1.2em;
+    }
+    .xr-ping-dots span {
+        width: 4px;
+        height: 4px;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: 0.22;
+        animation: xr-dot-seq 1.05s infinite ease-in-out;
+    }
+    .xr-ping-dots span:nth-child(2) { animation-delay: 0.22s; }
+    .xr-ping-dots span:nth-child(3) { animation-delay: 0.44s; }
+    @keyframes xr-dot-seq {
+        0%, 80%, 100% { opacity: 0.22; }
+        40% { opacity: 1; }
+    }
+
+    .xr-ping-opts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 18px;
+        align-items: center;
+        margin-top: 8px;
+    }
+    .xr-ping-opts label {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        cursor: pointer;
+        font-size: 0.94em;
+        user-select: none;
+    }
+    .xr-log-box {
+        margin-top: 10px;
+        margin-bottom: 0;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 4px;
+        padding: 10px;
+        font-family: monospace;
+        font-size: 0.82em;
+        max-height: 260px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        display: none;
+    }
+    .xr-log-btn-active {
+        background: rgba(79, 195, 247, 0.22) !important;
+        color: #4fc3f7 !important;
+        border: 1px solid #4fc3f7 !important;
+    }
+
+    /* Collapsible subscription header */
+    .xr-sub-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 10px;
+    }
+    .xr-sub-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        user-select: none;
+        padding: 2px 4px;
+        border-radius: 4px;
+    }
+    .xr-sub-toggle:hover {
+        background: rgba(255, 255, 255, 0.05);
+    }
+    .xr-sub-arrow {
+        display: inline-block;
+        width: 14px;
+        text-align: center;
+        font-size: 0.9em;
+        opacity: 0.8;
+    }
+    .xr-sub-settings-body {
+        padding: 10px 12px;
+        margin-bottom: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 4px;
+        background: rgba(0, 0, 0, 0.14);
+    }
+</style>
+
+<div class="cbi-section xr-card">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
+        <h3 style="margin:0;">Xray-core <span style="opacity:0.65; font-weight:normal;">v<%=xray_ver%></span></h3>
+        <div style="text-align:right; font-size:0.85em; line-height:1.55;">
+            <div><a href="https://github.com/XTLS/Xray-core" target="_blank" rel="noreferrer">https://github.com/XTLS/Xray-core</a></div>
+            <div><a href="https://github.com/fahrenheitd99/luci-app-xray-core" target="_blank" rel="noreferrer">https://github.com/fahrenheitd99/luci-app-xray-core</a></div>
+        </div>
+    </div>
+
+    <div class="xr-status-line">
+        <div>
+            Status:
+            <span id="xr-svc-badge" class="xr-badge <%=is_running and 'xr-badge-run' or 'xr-badge-stop'%>">
+                <%=is_running and "RUNNING" or "STOPPED"%>
+            </span>
+        </div>
+        <div>PID: <code id="xr-svc-pid"><%=pid%></code></div>
+        <div>Active Outbounds: <strong id="xr-active-profile" style="color:#4fc3f7;">None (Direct)</strong></div>
+    </div>
+
+    <div class="xr-controls">
+        <button type="button" id="btn-svc-start" class="cbi-button cbi-button-apply" onclick="xrayServiceCtl('start')" <%=is_running and 'disabled' or ''%>>Start</button>
+        <button type="button" id="btn-svc-restart" class="cbi-button cbi-button-action" onclick="xrayServiceCtl('restart')" <%=not is_running and 'disabled' or ''%>>Restart</button>
+        <button type="button" id="btn-svc-stop" class="cbi-button cbi-button-reset" onclick="xrayServiceCtl('stop')" <%=not is_running and 'disabled' or ''%>>Stop</button>
+        <span style="opacity:0.3; margin:0 6px;">|</span>
+        <button type="button" id="btn-svc-enable" class="cbi-button cbi-button-save" onclick="xrayServiceCtl('enable')" <%=is_enabled and 'disabled' or ''%>>Enable Autostart</button>
+        <button type="button" id="btn-svc-disable" class="cbi-button cbi-button-reset" onclick="xrayServiceCtl('disable')" <%=not is_enabled and 'disabled' or ''%>>Disable Autostart</button>
+    </div>
+
+    <hr style="border:none; border-top:1px solid rgba(255,255,255,0.1); margin:16px 0 12px 0;">
+
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <strong style="font-size:0.95em;">Ping Settings</strong>
+        <span id="xr-ping-settings-status" style="font-size:0.84em;"></span>
+    </div>
+    <div class="xr-ping-opts">
+        <label title="Direct TCP handshake latency">
+            <input type="checkbox" id="chk-ping-tcp" onchange="setPingModeSetting('tcp')">
+            TCP Ping
+        </label>
+        <label title="HTTP HEAD request through an isolated proxy instance">
+            <input type="checkbox" id="chk-ping-head" checked onchange="setPingModeSetting('head')">
+            Via Proxy (HTTP HEAD)
+        </label>
+        <span style="opacity:0.25;">|</span>
+        <label title="Dynamically sort nodes from lowest to highest latency during Ping All">
+            <input type="checkbox" id="chk-ping-autosort" onchange="setAutoSortSetting(this.checked)">
+            Auto-sort nodes by ping (Ping All)
+        </label>
+    </div>
+</div>
+EOF
+
+echo "===> Updating /usr/lib/lua/luci/view/xray_service_extra.htm..."
+cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
+<style>
+    .xr-geo-split {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin: 0 0 12px 0 !important;
+    }
+    @media (max-width: 820px) {
+        .xr-geo-split { grid-template-columns: 1fr; }
+    }
+    .xr-geo-split > .xr-card {
+        margin: 0 !important;
+        display: flex;
+        flex-direction: column;
+    }
+    .xr-geo-dir-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .xr-geo-dir-input {
+        width: 155px !important;
+        min-width: 110px;
+        font-family: monospace;
+        font-size: 0.86em !important;
+        padding: 3px 7px !important;
+        height: auto !important;
+    }
+    .xr-geo-table-wrap {
+        max-height: 220px;
+        overflow-y: auto;
+        margin-top: 8px;
+    }
+    .xr-cron-row {
+        display: grid;
+        grid-template-columns: 26px 1fr 200px 150px 36px;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 8px;
+    }
+    @media (max-width: 820px) {
+        .xr-cron-row { grid-template-columns: 26px 1fr; }
+    }
+    .xr-cron-row input[type="text"],
+    .xr-cron-row select {
+        width: 100%;
+        box-sizing: border-box;
+    }
+    .xr-cron-disabled {
+        opacity: 0.5;
+    }
+    .xr-limits-row {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+        align-items: end;
+    }
+    .xr-logs-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        align-items: center;
+        justify-content: space-between;
+    }
+    .xr-logs-checks, .xr-logs-btns {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+    }
+    .xr-logs-checks label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+        user-select: none;
+        margin: 0;
+        font-size: 0.93em;
+    }
+</style>
+
+<!-- 1. Geofiles: two equal boxes with inline Asset Directory -->
+<div class="xr-geo-split">
+    <div class="cbi-section xr-card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:4px;">
+            <strong style="font-size:0.95em;">Geofiles (.dat)</strong>
+            <div class="xr-geo-dir-wrap">
+                <input type="text" id="xr-geo-dir-input" class="cbi-input-text xr-geo-dir-input" value="/usr/bin/" placeholder="/usr/bin/" title="Asset Directory path" onkeydown="if(event.key==='Enter'){event.preventDefault();xrSaveAssetDir();}">
+                <button type="button" id="xr-geo-dir-save" class="cbi-button cbi-button-save" style="padding:3px 10px;" onclick="xrSaveAssetDir()">Save</button>
+            </div>
+        </div>
+        <div id="xr-geo-dir-status" style="font-size:0.82em; text-align:right; min-height:0;"></div>
+        <div class="xr-geo-table-wrap">
+            <table class="table cbi-section-table" style="width:100%; margin-bottom:0;">
+                <tr class="tr cbi-section-table-titles">
+                    <th class="th">Filename</th>
+                    <th class="th" style="width:24%; text-align:right;">Size</th>
+                    <th class="th" style="width:32%; text-align:right;">Modified</th>
+                </tr>
+                <tbody id="xr-geo-files-body">
+                    <tr class="tr"><td class="td" colspan="3"><em>Loading...</em></td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="cbi-section xr-card">
+        <strong style="font-size:0.95em; margin-bottom:10px; display:block;">Download Geofile</strong>
+        <div class="xr-field" style="margin-bottom:10px;">
+            <label>File URL</label>
+            <input type="text" id="xr-geo-dl-url" class="cbi-input-text" placeholder="https://github.com/.../releases/latest/download/geosite.dat">
+        </div>
+        <div class="xr-field" style="margin-bottom:12px;">
+            <label>Filename</label>
+            <input type="text" id="xr-geo-dl-name" class="cbi-input-text" placeholder="geosite.dat">
+        </div>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:auto;">
+            <button type="button" id="xr-geo-dl-btn" class="cbi-button cbi-button-apply" onclick="xrDownloadGeofile()">Download</button>
+            <span id="xr-geo-dl-status" style="font-size:0.86em;"></span>
+        </div>
+    </div>
+</div>
+
+<!-- 2. Automation (Cron) & Runtime Limits -->
+<div class="cbi-section xr-card">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+        <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-weight:600; font-size:0.95em; margin:0;">
+            <input type="checkbox" id="xr-cron-geo-master" onchange="xrToggleGeoCronMaster(this.checked)">
+            Geofile Auto-Update (Cron)
+        </label>
+        <button type="button" id="xr-cron-geo-add" class="cbi-button cbi-button-add" onclick="xrAddGeoCronRow()">+ Add Geofile</button>
+    </div>
+
+    <div id="xr-cron-geo-rows"></div>
+
+    <hr style="border:none; border-top:1px solid rgba(255,255,255,0.1); margin:14px 0;">
+
+    <strong style="font-size:0.95em; display:block; margin-bottom:10px;">Xray Service Schedule &amp; Runtime Limits</strong>
+
+    <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:14px;">
+        <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; margin:0;">
+            <input type="checkbox" id="xr-cron-restart-en" onchange="xrToggleRestartCron(this.checked)">
+            Auto-Restart Xray (Cron)
+        </label>
+        <select id="xr-cron-restart-int" class="cbi-input-select" style="width:180px;">
+            <option value="1h">Every 1 hour</option>
+            <option value="3h">Every 3 hours</option>
+            <option value="6h">Every 6 hours</option>
+            <option value="12h">Every 12 hours</option>
+            <option value="1d" selected>Every 1 day</option>
+            <option value="3d">Every 3 days</option>
+            <option value="7d">Every 7 days</option>
+            <option value="14d">Every 14 days</option>
+            <option value="30d">Every 30 days</option>
+        </select>
+        <button type="button" id="xr-cron-save-btn" class="cbi-button cbi-button-save" onclick="xrSaveCronSettings()">Save Schedule</button>
+        <span id="xr-cron-status" style="font-size:0.86em;"></span>
+    </div>
+
+    <hr style="border:none; border-top:1px dashed rgba(255,255,255,0.1); margin:14px 0;">
+
+    <div class="xr-limits-row">
+        <div class="xr-field">
+            <label>GOMEMLIMIT</label>
+            <input type="text" id="xr-lim-mem" class="cbi-input-text" placeholder="65MiB">
+        </div>
+        <div class="xr-field">
+            <label>GOGC</label>
+            <input type="text" id="xr-lim-gc" class="cbi-input-text" placeholder="40">
+        </div>
+        <div style="display:flex; gap:10px; align-items:center;">
+            <button type="button" id="xr-lim-save-btn" class="cbi-button cbi-button-save" onclick="xrSaveLimits()">Save Limits</button>
+            <span id="xr-lim-status" style="font-size:0.86em;"></span>
+        </div>
+    </div>
+</div>
+
+<!-- 3. Logs (Ping Log + Xray-core Log) -->
+<div class="cbi-section xr-card">
+    <div class="xr-logs-bar">
+        <div class="xr-logs-checks">
+            <strong style="font-size:0.95em; margin-right:4px;">Logs</strong>
+            <label title="Write ping diagnostics to /tmp/xray_ping.log">
+                <input type="checkbox" id="xr-log-ping-en" onchange="xrSetLogToggle('ping', this.checked)">
+                Ping Log
+            </label>
+            <label title="Set Xray loglevel to info (off = error)">
+                <input type="checkbox" id="xr-log-xray-en" onchange="xrSetLogToggle('xray', this.checked)">
+                Xray-core Log
+            </label>
+            <span id="xr-log-status" style="font-size:0.84em;"></span>
+        </div>
+
+        <div class="xr-logs-btns">
+            <button type="button" id="btn-show-ping-log" class="cbi-button cbi-button-action" onclick="xrSwitchLogView('ping')">Show Ping Log</button>
+            <button type="button" id="btn-show-xray-log" class="cbi-button cbi-button-action" onclick="xrSwitchLogView('xray')">Show Xray-core Log</button>
+            <button type="button" id="btn-refresh-active-log" class="cbi-button cbi-button-neutral" style="display:none;" onclick="xrRefreshActiveLog()">Refresh</button>
+            <button type="button" id="btn-clear-ping-log" class="cbi-button cbi-button-reset" style="display:none;" onclick="xrClearActivePingLog()">Clear</button>
+        </div>
+    </div>
+    <pre id="xr-unified-log-box" class="xr-log-box"></pre>
+</div>
+
+<script>
+(function() {
+    let cronState = {
+        geo_enabled: false,
+        geofiles: [
+            { enabled: false, url: '', filename: 'geosite.dat', interval: '7d' },
+            { enabled: false, url: '', filename: 'geoip.dat', interval: '7d' }
+        ],
+        restart_enabled: false,
+        restart_interval: '1d'
+    };
+
+    let activeLogView = null; // null | 'ping' | 'xray'
+
+    const INTERVAL_OPTIONS = [
+        ['1h',  'Every 1 hour'],
+        ['3h',  'Every 3 hours'],
+        ['6h',  'Every 6 hours'],
+        ['12h', 'Every 12 hours'],
+        ['1d',  'Every 1 day'],
+        ['3d',  'Every 3 days'],
+        ['7d',  'Every 7 days'],
+        ['14d', 'Every 14 days'],
+        ['30d', 'Every 30 days']
+    ];
+
+    function xrEsc(s) {
+        if (!s) return '';
+        return String(s).replace(/[&<>"']/g, function(m) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[m];
+        });
+    }
+
+    function fmtSize(bytes) {
+        const b = Number(bytes) || 0;
+        if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+        if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
+        return b + ' B';
+    }
+
+    function fmtMtime(ts) {
+        if (!ts) return '-';
+        const d = new Date(ts * 1000);
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function renderGeoFiles(dir, files) {
+        const dirInput = document.getElementById('xr-geo-dir-input');
+        const tbody = document.getElementById('xr-geo-files-body');
+        if (dirInput && dir) dirInput.value = dir;
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        if (!Array.isArray(files) || files.length === 0) {
+            tbody.innerHTML = '<tr class="tr"><td class="td" colspan="3"><em>No .dat files found in directory.</em></td></tr>';
+            return;
+        }
+        files.forEach(f => {
+            const tr = document.createElement('tr');
+            tr.className = 'tr cbi-section-table-row';
+            tr.innerHTML = `
+                <td class="td"><code>${xrEsc(f.name)}</code></td>
+                <td class="td" style="text-align:right; white-space:nowrap;">${xrEsc(fmtSize(f.size))}</td>
+                <td class="td" style="text-align:right; white-space:nowrap; opacity:0.8;">${xrEsc(fmtMtime(f.mtime))}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    function loadGeoFiles() {
+        fetch('<%=url("admin/services/xray/geo_list")%>')
+            .then(r => r.json())
+            .then(data => renderGeoFiles(data.dir, data.files))
+            .catch(() => renderGeoFiles('/usr/bin/', []));
+    }
+
+    window.xrSaveAssetDir = function() {
+        const input = document.getElementById('xr-geo-dir-input');
+        const btn = document.getElementById('xr-geo-dir-save');
+        const st = document.getElementById('xr-geo-dir-status');
+        const dir = input ? input.value.trim() : '';
+
+        if (!dir || dir.charAt(0) !== '/') {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Path must start with /'; }
+            return;
+        }
+
+        if (btn) btn.disabled = true;
+        if (st) { st.style.color = '#4fc3f7'; st.textContent = 'Saving...'; }
+
+        fetch('<%=url("admin/services/xray/service_ext")%>', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ section: 'asset_dir', asset_dir: dir })
+        }).then(r => r.json()).then(res => {
+            if (res && res.success) {
+                renderGeoFiles(res.dir, res.files);
+                if (res.service && typeof updateServiceUI === 'function') updateServiceUI(res.service);
+                if (st) {
+                    st.style.color = '#66bb6a';
+                    st.textContent = res.restarted ? 'Saved & Xray restarted' : 'Saved';
+                    setTimeout(() => { if (st.textContent === 'Saved' || st.textContent === 'Saved & Xray restarted') st.textContent = ''; }, 2500);
+                }
+            } else {
+                if (st) { st.style.color = '#ef5350'; st.textContent = (res && res.error) ? res.error : 'Save failed'; }
+            }
+        }).catch(err => {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Request error: ' + err; }
+        }).finally(() => {
+            if (btn) btn.disabled = false;
+        });
+    };
+
+    window.xrDownloadGeofile = function() {
+        const urlEl = document.getElementById('xr-geo-dl-url');
+        const nameEl = document.getElementById('xr-geo-dl-name');
+        const btn = document.getElementById('xr-geo-dl-btn');
+        const st = document.getElementById('xr-geo-dl-status');
+
+        const url = urlEl ? urlEl.value.trim() : '';
+        const filename = nameEl ? nameEl.value.trim() : '';
+
+        if (!url || !filename) {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Enter both URL and filename.'; }
+            return;
+        }
+
+        if (btn) { btn.disabled = true; btn.textContent = 'Downloading...'; }
+        if (st) { st.style.color = '#4fc3f7'; st.textContent = 'Running wget...'; }
+
+        fetch('<%=url("admin/services/xray/geo_download")%>', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url, filename: filename })
+        }).then(r => r.json()).then(res => {
+            if (res && res.files) renderGeoFiles(res.dir, res.files);
+            if (res && res.success) {
+                if (st) { st.style.color = '#66bb6a'; st.textContent = 'Downloaded: ' + filename; }
+            } else {
+                if (st) { st.style.color = '#ef5350'; st.textContent = (res && res.error) ? res.error : 'Download failed'; }
+            }
+        }).catch(err => {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Request error: ' + err; }
+        }).finally(() => {
+            if (btn) { btn.disabled = false; btn.textContent = 'Download'; }
+        });
+    };
+
+    function syncCronStateFromDOM() {
+        const master = document.getElementById('xr-cron-geo-master');
+        if (master) cronState.geo_enabled = master.checked;
+
+        const rows = document.querySelectorAll('#xr-cron-geo-rows .xr-cron-row');
+        const list = [];
+        rows.forEach(row => {
+            list.push({
+                enabled: row.querySelector('.xr-cg-en').checked,
+                url: row.querySelector('.xr-cg-url').value.trim(),
+                filename: row.querySelector('.xr-cg-name').value.trim(),
+                interval: row.querySelector('.xr-cg-int').value
+            });
+        });
+        cronState.geofiles = list;
+
+        const rEn = document.getElementById('xr-cron-restart-en');
+        const rInt = document.getElementById('xr-cron-restart-int');
+        if (rEn) cronState.restart_enabled = rEn.checked;
+        if (rInt) cronState.restart_interval = rInt.value;
+    }
+
+    function renderCronUI() {
+        const master = document.getElementById('xr-cron-geo-master');
+        const addBtn = document.getElementById('xr-cron-geo-add');
+        const cont = document.getElementById('xr-cron-geo-rows');
+        const enabledMaster = !!cronState.geo_enabled;
+
+        if (master) master.checked = enabledMaster;
+        if (addBtn) addBtn.disabled = !enabledMaster;
+        if (!cont) return;
+
+        cont.innerHTML = '';
+        if (!Array.isArray(cronState.geofiles) || cronState.geofiles.length === 0) {
+            cronState.geofiles = [{ enabled: false, url: '', filename: 'geosite.dat', interval: '7d' }];
+        }
+
+        cronState.geofiles.forEach((g, idx) => {
+            const row = document.createElement('div');
+            row.className = 'xr-cron-row' + (enabledMaster ? '' : ' xr-cron-disabled');
+            const optsHtml = INTERVAL_OPTIONS.map(o =>
+                `<option value="${o[0]}" ${g.interval === o[0] ? 'selected' : ''}>${o[1]}</option>`
+            ).join('');
+
+            row.innerHTML = `
+                <input type="checkbox" class="xr-cg-en" ${g.enabled ? 'checked' : ''} ${enabledMaster ? '' : 'disabled'}>
+                <input type="text" class="cbi-input-text xr-cg-url" value="${xrEsc(g.url || '')}" placeholder="https://.../geosite.dat" ${enabledMaster ? '' : 'disabled'}>
+                <input type="text" class="cbi-input-text xr-cg-name" value="${xrEsc(g.filename || '')}" placeholder="geosite.dat" ${enabledMaster ? '' : 'disabled'}>
+                <select class="cbi-input-select xr-cg-int" ${enabledMaster ? '' : 'disabled'}>${optsHtml}</select>
+                <button type="button" class="cbi-button cbi-button-remove xr-cg-del" title="Remove row" ${enabledMaster ? '' : 'disabled'}>&times;</button>
+            `;
+            row.querySelector('.xr-cg-del').addEventListener('click', () => {
+                syncCronStateFromDOM();
+                cronState.geofiles.splice(idx, 1);
+                renderCronUI();
+            });
+            cont.appendChild(row);
+        });
+
+        const rEn = document.getElementById('xr-cron-restart-en');
+        const rInt = document.getElementById('xr-cron-restart-int');
+        if (rEn) rEn.checked = !!cronState.restart_enabled;
+        if (rInt) {
+            rInt.value = cronState.restart_interval || '1d';
+            rInt.disabled = !cronState.restart_enabled;
+        }
+    }
+
+    window.xrToggleGeoCronMaster = function(checked) {
+        syncCronStateFromDOM();
+        cronState.geo_enabled = !!checked;
+        renderCronUI();
+    };
+
+    window.xrAddGeoCronRow = function() {
+        syncCronStateFromDOM();
+        cronState.geofiles.push({ enabled: true, url: '', filename: '', interval: '7d' });
+        renderCronUI();
+    };
+
+    window.xrToggleRestartCron = function(checked) {
+        const rInt = document.getElementById('xr-cron-restart-int');
+        cronState.restart_enabled = !!checked;
+        if (rInt) rInt.disabled = !checked;
+    };
+
+    window.xrSaveCronSettings = function() {
+        syncCronStateFromDOM();
+        const btn = document.getElementById('xr-cron-save-btn');
+        const st = document.getElementById('xr-cron-status');
+        if (btn) btn.disabled = true;
+        if (st) { st.style.color = '#4fc3f7'; st.textContent = 'Applying crontab...'; }
+
+        fetch('<%=url("admin/services/xray/service_ext")%>', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ section: 'cron', cron: cronState })
+        }).then(r => r.json()).then(res => {
+            if (res && res.success) {
+                if (st) { st.style.color = '#66bb6a'; st.textContent = `Saved (${res.jobs || 0} active cron jobs)`; }
+            } else {
+                if (st) { st.style.color = '#ef5350'; st.textContent = (res && res.error) ? res.error : 'Save failed'; }
+            }
+        }).catch(err => {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Request error: ' + err; }
+        }).finally(() => {
+            if (btn) btn.disabled = false;
+        });
+    };
+
+    window.xrSaveLimits = function() {
+        const memEl = document.getElementById('xr-lim-mem');
+        const gcEl = document.getElementById('xr-lim-gc');
+        const btn = document.getElementById('xr-lim-save-btn');
+        const st = document.getElementById('xr-lim-status');
+
+        const gomemlimit = memEl ? memEl.value.trim() : '';
+        const gogc = gcEl ? gcEl.value.trim() : '';
+
+        if (btn) btn.disabled = true;
+        if (st) { st.style.color = '#4fc3f7'; st.textContent = 'Saving...'; }
+
+        fetch('<%=url("admin/services/xray/service_ext")%>', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ section: 'limits', limits: { gomemlimit: gomemlimit, gogc: gogc } })
+        }).then(r => r.json()).then(res => {
+            if (res && res.success) {
+                if (res.service && typeof updateServiceUI === 'function') updateServiceUI(res.service);
+                if (st) {
+                    st.style.color = '#66bb6a';
+                    st.textContent = res.restarted ? 'Saved & Xray restarted' : 'Saved';
+                }
+            } else {
+                if (st) { st.style.color = '#ef5350'; st.textContent = (res && res.error) ? res.error : 'Save failed'; }
+            }
+        }).catch(err => {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Request error: ' + err; }
+        }).finally(() => {
+            if (btn) btn.disabled = false;
+        });
+    };
+
+    function updateLogButtonsUI() {
+        const bPing = document.getElementById('btn-show-ping-log');
+        const bXray = document.getElementById('btn-show-xray-log');
+        const bRef = document.getElementById('btn-refresh-active-log');
+        const bClr = document.getElementById('btn-clear-ping-log');
+        const box = document.getElementById('xr-unified-log-box');
+
+        if (bPing) bPing.classList.toggle('xr-log-btn-active', activeLogView === 'ping');
+        if (bXray) bXray.classList.toggle('xr-log-btn-active', activeLogView === 'xray');
+        if (bRef) bRef.style.display = activeLogView ? '' : 'none';
+        if (bClr) bClr.style.display = (activeLogView === 'ping') ? '' : 'none';
+        if (box) box.style.display = activeLogView ? 'block' : 'none';
+    }
+
+    window.xrRefreshActiveLog = function() {
+        const box = document.getElementById('xr-unified-log-box');
+        if (!box || !activeLogView) return;
+        const url = (activeLogView === 'xray')
+            ? '<%=url("admin/services/xray/xray_log")%>'
+            : '<%=url("admin/services/xray/ping_log")%>';
+        fetch(url)
+            .then(r => r.text())
+            .then(txt => {
+                const trimmed = (txt || '').trim();
+                if (trimmed) {
+                    box.textContent = trimmed;
+                } else {
+                    box.textContent = (activeLogView === 'xray')
+                        ? '(No Xray-core log entries)'
+                        : '(Ping log is empty)';
+                }
+                box.scrollTop = box.scrollHeight;
+            })
+            .catch(err => {
+                box.textContent = 'Error loading log: ' + err;
+            });
+    };
+
+    window.xrSwitchLogView = function(target) {
+        if (activeLogView === target) {
+            activeLogView = null;
+            updateLogButtonsUI();
+            return;
+        }
+        activeLogView = target;
+        updateLogButtonsUI();
+        xrRefreshActiveLog();
+    };
+
+    window.xrClearActivePingLog = function() {
+        fetch('<%=url("admin/services/xray/ping_log")%>', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'clear=1'
+        }).then(() => {
+            if (activeLogView === 'ping') {
+                const box = document.getElementById('xr-unified-log-box');
+                if (box) box.textContent = '(Ping log is empty)';
+            }
+        });
+    };
+
+    window.xrSetLogToggle = function(kind, checked) {
+        const st = document.getElementById('xr-log-status');
+        const payload = { section: 'logging' };
+        if (kind === 'ping') payload.ping_log = !!checked;
+        if (kind === 'xray') payload.xray_log = !!checked;
+
+        if (st) { st.style.color = '#4fc3f7'; st.textContent = 'Applying...'; }
+
+        fetch('<%=url("admin/services/xray/service_ext")%>', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        }).then(r => r.json()).then(res => {
+            if (res && res.success) {
+                if (res.service && typeof updateServiceUI === 'function') updateServiceUI(res.service);
+                if (res.config && typeof updateConfigTextarea === 'function') updateConfigTextarea(res.config);
+                if (st) {
+                    st.style.color = '#66bb6a';
+                    if (kind === 'xray') {
+                        st.textContent = `loglevel: ${res.loglevel || (checked ? 'info' : 'error')}` + (res.restarted ? ' (restarted)' : '');
+                    } else {
+                        st.textContent = checked ? 'Ping log enabled' : 'Ping log disabled';
+                    }
+                    setTimeout(() => { if (st) st.textContent = ''; }, 2500);
+                }
+                if (activeLogView === 'xray' && kind === 'xray') {
+                    setTimeout(xrRefreshActiveLog, 500);
+                }
+            } else {
+                if (st) { st.style.color = '#ef5350'; st.textContent = (res && res.error) ? res.error : 'Failed'; }
+            }
+        }).catch(err => {
+            if (st) { st.style.color = '#ef5350'; st.textContent = 'Request error: ' + err; }
+        });
+    };
+
+    function loadServiceExt() {
+        fetch('<%=url("admin/services/xray/service_ext")%>')
+            .then(r => r.json())
+            .then(data => {
+                if (data && data.asset_dir) {
+                    const dirIn = document.getElementById('xr-geo-dir-input');
+                    if (dirIn) dirIn.value = data.asset_dir;
+                }
+                if (data && data.cron) cronState = data.cron;
+                renderCronUI();
+                if (data && data.limits) {
+                    const memEl = document.getElementById('xr-lim-mem');
+                    const gcEl = document.getElementById('xr-lim-gc');
+                    if (memEl) memEl.value = data.limits.gomemlimit || '65MiB';
+                    if (gcEl) gcEl.value = data.limits.gogc || '40';
+                }
+                if (data && data.logging) {
+                    const pChk = document.getElementById('xr-log-ping-en');
+                    const xChk = document.getElementById('xr-log-xray-en');
+                    if (pChk) pChk.checked = !!data.logging.ping_log;
+                    if (xChk) xChk.checked = !!data.logging.xray_log;
+                }
+            })
+            .catch(() => renderCronUI());
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        loadGeoFiles();
+        loadServiceExt();
+    });
+})();
+</script>
+EOF
+
+echo "===> Clearing LuCI cache..."
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
+
+echo "===> Service layout & Logs update completed! Refresh LuCI."
+
 lua /usr/libexec/xray-ui-core.lua generate
 /etc/init.d/xray restart
 
