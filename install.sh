@@ -7615,25 +7615,128 @@ lua /usr/libexec/xray-ui-core.lua generate
 echo "===> Clearing LuCI cache..."
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
-echo "===> Fixing main Xray PID detection..."
-lua - << 'EOF'
+echo "===> Fixing Xray PID detection and synchronous Start/Stop/Restart..."
+cp /usr/lib/lua/luci/controller/xray.lua /tmp/xray_ctl.lua.bak
+lua - << 'EOF' || { mv /tmp/xray_ctl.lua.bak /usr/lib/lua/luci/controller/xray.lua; exit 1; }
 local fs = require "nixio.fs"
-local pid_expr = [[(sys.exec("ps w | grep '[x]ray run -c /etc/xray/config.json' | awk '{print $1; exit}'") or ""):match("%d+") or ""]]
 
-for _, path in ipairs({
-    "/usr/lib/lua/luci/controller/xray.lua",
-    "/usr/lib/lua/luci/view/xray_status.htm"
-}) do
-    local src = fs.readfile(path)
-    if src then
-        src = src:gsub('sys%.exec%("pidof xray"%):gsub%("%%s%+", ""%)', function() return pid_expr end)
-        src = src:gsub('sys%.call%("pidof xray >/dev/null 2>&1"%) == 0', function() return "(" .. pid_expr .. ") ~= \"\"" end)
-        fs.writefile(path, src)
+local function replace_plain(str, find_s, repl_s)
+    local out, i = {}, 1
+    while true do
+        local s, e = str:find(find_s, i, true)
+        if not s then
+            table.insert(out, str:sub(i))
+            break
+        end
+        table.insert(out, str:sub(i, s - 1))
+        table.insert(out, repl_s)
+        i = e + 1
+    end
+    return table.concat(out)
+end
+
+-- 1. Патчим controller/xray.lua
+local ctl_path = "/usr/lib/lua/luci/controller/xray.lua"
+local src = fs.readfile(ctl_path)
+assert(src, "cannot read " .. ctl_path)
+
+local s1 = src:find("local function get_main_pid()", 1, true)
+    or src:find("local function get_service_status()", 1, true)
+local e1 = src:find("local function default_cron_cfg()", 1, true)
+assert(s1 and e1 and e1 > s1, "anchors for get_service_status not found")
+
+local status_block = [[local function get_main_pid()
+    local out = sys.exec("ps w | grep '[x]ray run -c /etc/xray/config.json' | awk '{print $1; exit}'") or ""
+    return out:match("%d+") or ""
+end
+
+local function sleep_ms(ms)
+    if nixio and nixio.nanosleep then
+        nixio.nanosleep(math.floor(ms / 1000), (ms % 1000) * 1000000)
+    else
+        os.execute("sleep 1")
     end
 end
 
-assert(loadfile("/usr/lib/lua/luci/controller/xray.lua"), "syntax error in controller/xray.lua")
+local function wait_pid_state(want_running, timeout_ms)
+    local steps = math.max(1, math.floor((timeout_ms or 2000) / 100))
+    for _ = 1, steps do
+        local running = (get_main_pid() ~= "")
+        if running == want_running then return true end
+        sleep_ms(100)
+    end
+    return (get_main_pid() ~= "") == want_running
+end
+
+local function restart_xray_sync()
+    sys.call("/etc/init.d/xray stop >/dev/null 2>&1")
+    wait_pid_state(false, 2000)
+    sleep_ms(150)
+    sys.call("/etc/init.d/xray start >/dev/null 2>&1")
+    wait_pid_state(true, 3000)
+end
+
+local function get_service_status()
+    local pid = get_main_pid()
+    local is_running = (pid ~= "")
+    local is_enabled = (sys.call("/etc/init.d/xray enabled >/dev/null 2>&1") == 0)
+    return {
+        running = is_running,
+        pid = is_running and pid or "-",
+        enabled = is_enabled
+    }
+end
+
+]]
+
+src = src:sub(1, s1 - 1) .. status_block .. src:sub(e1)
+
+local s2 = src:find("function action_service_ctl()", 1, true)
+local e2 = src:find("function action_get_config()", 1, true)
+assert(s2 and e2 and e2 > s2, "anchors for action_service_ctl not found")
+
+local ctl_block = [[function action_service_ctl()
+    local act = http.formvalue("action")
+    if act == "start" then
+        sys.call("/etc/init.d/xray start >/dev/null 2>&1")
+        wait_pid_state(true, 3000)
+    elseif act == "stop" then
+        sys.call("/etc/init.d/xray stop >/dev/null 2>&1")
+        wait_pid_state(false, 2000)
+    elseif act == "restart" then
+        restart_xray_sync()
+    elseif act == "enable" then
+        sys.call("/etc/init.d/xray enable >/dev/null 2>&1")
+    elseif act == "disable" then
+        sys.call("/etc/init.d/xray disable >/dev/null 2>&1")
+    end
+    http.prepare_content("application/json")
+    http.write(json.stringify(get_service_status()))
+end
+
+]]
+
+src = src:sub(1, s2 - 1) .. ctl_block .. src:sub(e2)
+
+-- Заменяем остальные проверки PID и вызовы restart в контроллере на синхронные
+local prev_pid_check = [[((sys.exec("ps w | grep '[x]ray run -c /etc/xray/config.json' | awk '{print $1; exit}'") or ""):match("%d+") or "") ~= ""]]
+src = replace_plain(src, 'sys.call("pidof xray >/dev/null 2>&1") == 0', 'get_main_pid() ~= ""')
+src = replace_plain(src, prev_pid_check, 'get_main_pid() ~= ""')
+src = replace_plain(src, 'sys.call("/etc/init.d/xray restart >/dev/null 2>&1")', 'restart_xray_sync()')
+
+fs.writefile(ctl_path, src)
+assert(loadfile(ctl_path), "syntax error in controller/xray.lua")
+
+-- 2. Патчим view/xray_status.htm
+local st_path = "/usr/lib/lua/luci/view/xray_status.htm"
+local st_src = fs.readfile(st_path)
+if st_src then
+    local pid_expr = [[(sys.exec("ps w | grep '[x]ray run -c /etc/xray/config.json' | awk '{print $1; exit}'") or ""):match("%d+") or ""]]
+    st_src = replace_plain(st_src, 'sys.exec("pidof xray"):gsub("%s+", "")', pid_expr)
+    fs.writefile(st_path, st_src)
+end
 EOF
+rm -f /tmp/xray_ctl.lua.bak
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
 echo "===> Setup completed! Refresh your LuCI web interface."
