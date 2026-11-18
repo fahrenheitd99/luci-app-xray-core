@@ -7017,26 +7017,7 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         margin: 0;
         font-size: 0.93em;
     }
-    .xr-log-live {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        font-size: 0.8em;
-        font-weight: 600;
-        color: #66bb6a;
-        letter-spacing: 0.3px;
-    }
-    .xr-live-dot {
-        width: 7px;
-        height: 7px;
-        border-radius: 50%;
-        background: #66bb6a;
-        animation: xr-live-blink 1.4s ease-in-out infinite;
-    }
-    @keyframes xr-live-blink {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.25; }
-    }
+    
 </style>
 
 <!-- 1. Geofiles: two equal boxes with inline Asset Directory -->
@@ -7152,7 +7133,6 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         </div>
 
         <div class="xr-logs-btns">
-            <span id="xr-log-live-ind" class="xr-log-live" style="display:none;"><span class="xr-live-dot"></span>Live</span>
             <button type="button" id="btn-show-ping-log" class="cbi-button cbi-button-action" onclick="xrSwitchLogView('ping')">Show Ping Log</button>
             <button type="button" id="btn-show-xray-log" class="cbi-button cbi-button-action" onclick="xrSwitchLogView('xray')">Show Xray-core Log</button>
             <button type="button" id="btn-clear-ping-log" class="cbi-button cbi-button-reset" style="display:none;" onclick="xrClearActivePingLog()">Clear</button>
@@ -7468,13 +7448,11 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         const bPing = document.getElementById('btn-show-ping-log');
         const bXray = document.getElementById('btn-show-xray-log');
         const bClr = document.getElementById('btn-clear-ping-log');
-        const liveInd = document.getElementById('xr-log-live-ind');
         const box = document.getElementById('xr-unified-log-box');
 
         if (bPing) bPing.classList.toggle('xr-log-btn-active', activeLogView === 'ping');
         if (bXray) bXray.classList.toggle('xr-log-btn-active', activeLogView === 'xray');
         if (bClr) bClr.style.display = (activeLogView === 'ping') ? '' : 'none';
-        if (liveInd) liveInd.style.display = activeLogView ? 'inline-flex' : 'none';
         if (box) box.style.display = activeLogView ? 'block' : 'none';
     }
 
