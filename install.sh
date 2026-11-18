@@ -1597,19 +1597,6 @@ elseif cmd == "fetch" then
         end
     end
 
-        if #new_nodes == 0 then
-            for line in source_text:gmatch("[^\r\n]+") do
-                if line:match("^vless://") then
-                    local p = parse_vless(line)
-                    if p then
-                        sanitize_outbound(p.outbound, p.name)
-                        table.insert(new_nodes, p)
-                    end
-                end
-            end
-        end
-    end
-
     fs.remove("/tmp/sub.json")
 
     if #new_nodes > 0 then
