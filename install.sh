@@ -6598,7 +6598,7 @@ function action_service_ext()
 end
 EOF
 
-echo "===> Updating /usr/lib/lua/luci/model/cbi/xray.lua (removing standalone Asset Directory)..."
+echo "===> Updating /usr/lib/lua/luci/model/cbi/xray.lua..."
 cat << 'EOF' > /usr/lib/lua/luci/model/cbi/xray.lua
 local fs = require "nixio.fs"
 local sys = require "luci.sys"
@@ -6646,7 +6646,7 @@ end
 return m
 EOF
 
-echo "===> Updating /usr/lib/lua/luci/view/xray_status.htm (uniform card spacing, move log controls down)..."
+echo "===> Updating /usr/lib/lua/luci/view/xray_status.htm..."
 cat << 'EOF' > /usr/lib/lua/luci/view/xray_status.htm
 <%
     local sys = require "luci.sys"
@@ -6936,7 +6936,7 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_status.htm
 </div>
 EOF
 
-echo "===> Updating /usr/lib/lua/luci/view/xray_service_extra.htm..."
+echo "===> Updating /usr/lib/lua/luci/view/xray_service_extra.htm (live real-time logs)..."
 cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
 <style>
     .xr-geo-split {
@@ -7016,6 +7016,26 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         user-select: none;
         margin: 0;
         font-size: 0.93em;
+    }
+    .xr-log-live {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 0.8em;
+        font-weight: 600;
+        color: #66bb6a;
+        letter-spacing: 0.3px;
+    }
+    .xr-live-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #66bb6a;
+        animation: xr-live-blink 1.4s ease-in-out infinite;
+    }
+    @keyframes xr-live-blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.25; }
     }
 </style>
 
@@ -7115,7 +7135,7 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
     </div>
 </div>
 
-<!-- 3. Logs (Ping Log + Xray-core Log) -->
+<!-- 3. Live Logs (Ping Log + Xray-core Log) -->
 <div class="cbi-section xr-card">
     <div class="xr-logs-bar">
         <div class="xr-logs-checks">
@@ -7132,9 +7152,9 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         </div>
 
         <div class="xr-logs-btns">
+            <span id="xr-log-live-ind" class="xr-log-live" style="display:none;"><span class="xr-live-dot"></span>Live</span>
             <button type="button" id="btn-show-ping-log" class="cbi-button cbi-button-action" onclick="xrSwitchLogView('ping')">Show Ping Log</button>
             <button type="button" id="btn-show-xray-log" class="cbi-button cbi-button-action" onclick="xrSwitchLogView('xray')">Show Xray-core Log</button>
-            <button type="button" id="btn-refresh-active-log" class="cbi-button cbi-button-neutral" style="display:none;" onclick="xrRefreshActiveLog()">Refresh</button>
             <button type="button" id="btn-clear-ping-log" class="cbi-button cbi-button-reset" style="display:none;" onclick="xrClearActivePingLog()">Clear</button>
         </div>
     </div>
@@ -7154,6 +7174,10 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
     };
 
     let activeLogView = null; // null | 'ping' | 'xray'
+    let logPollTimer = null;
+    let logPollSeq = 0;
+    let lastLogText = null;
+    const LOG_POLL_MS = 1000;
 
     const INTERVAL_OPTIONS = [
         ['1h',  'Every 1 hour'],
@@ -7432,53 +7456,84 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         });
     };
 
+    function stopLogPolling() {
+        logPollSeq += 1;
+        if (logPollTimer) {
+            clearTimeout(logPollTimer);
+            logPollTimer = null;
+        }
+    }
+
     function updateLogButtonsUI() {
         const bPing = document.getElementById('btn-show-ping-log');
         const bXray = document.getElementById('btn-show-xray-log');
-        const bRef = document.getElementById('btn-refresh-active-log');
         const bClr = document.getElementById('btn-clear-ping-log');
+        const liveInd = document.getElementById('xr-log-live-ind');
         const box = document.getElementById('xr-unified-log-box');
 
         if (bPing) bPing.classList.toggle('xr-log-btn-active', activeLogView === 'ping');
         if (bXray) bXray.classList.toggle('xr-log-btn-active', activeLogView === 'xray');
-        if (bRef) bRef.style.display = activeLogView ? '' : 'none';
         if (bClr) bClr.style.display = (activeLogView === 'ping') ? '' : 'none';
+        if (liveInd) liveInd.style.display = activeLogView ? 'inline-flex' : 'none';
         if (box) box.style.display = activeLogView ? 'block' : 'none';
     }
 
-    window.xrRefreshActiveLog = function() {
+    function pollActiveLog(seq, forceScroll) {
+        if (seq !== logPollSeq || !activeLogView) return;
         const box = document.getElementById('xr-unified-log-box');
-        if (!box || !activeLogView) return;
-        const url = (activeLogView === 'xray')
+        if (!box) return;
+
+        // Пауза при скрытой вкладке браузера или другой вкладке LuCI
+        if (document.hidden || box.offsetParent === null) {
+            logPollTimer = setTimeout(() => pollActiveLog(seq, false), LOG_POLL_MS);
+            return;
+        }
+
+        const view = activeLogView;
+        const url = (view === 'xray')
             ? '<%=url("admin/services/xray/xray_log")%>'
             : '<%=url("admin/services/xray/ping_log")%>';
-        fetch(url)
+
+        fetch(url, { cache: 'no-store' })
             .then(r => r.text())
             .then(txt => {
+                if (seq !== logPollSeq || activeLogView !== view) return;
                 const trimmed = (txt || '').trim();
-                if (trimmed) {
-                    box.textContent = trimmed;
-                } else {
-                    box.textContent = (activeLogView === 'xray')
-                        ? '(No Xray-core log entries)'
-                        : '(Ping log is empty)';
+                const displayText = trimmed
+                    ? trimmed
+                    : (view === 'xray' ? '(No Xray-core log entries)' : '(Ping log is empty)');
+
+                if (displayText !== lastLogText) {
+                    const nearBottom = forceScroll || ((box.scrollHeight - box.scrollTop - box.clientHeight) <= 32);
+                    box.textContent = displayText;
+                    lastLogText = displayText;
+                    if (nearBottom) {
+                        box.scrollTop = box.scrollHeight;
+                    }
                 }
-                box.scrollTop = box.scrollHeight;
             })
-            .catch(err => {
-                box.textContent = 'Error loading log: ' + err;
+            .catch(() => {})
+            .finally(() => {
+                if (seq === logPollSeq && activeLogView === view) {
+                    logPollTimer = setTimeout(() => pollActiveLog(seq, false), LOG_POLL_MS);
+                }
             });
-    };
+    }
 
     window.xrSwitchLogView = function(target) {
+        stopLogPolling();
         if (activeLogView === target) {
             activeLogView = null;
+            lastLogText = null;
             updateLogButtonsUI();
             return;
         }
         activeLogView = target;
+        lastLogText = null;
         updateLogButtonsUI();
-        xrRefreshActiveLog();
+        const box = document.getElementById('xr-unified-log-box');
+        if (box) box.textContent = 'Loading...';
+        pollActiveLog(logPollSeq, true);
     };
 
     window.xrClearActivePingLog = function() {
@@ -7489,7 +7544,8 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
         }).then(() => {
             if (activeLogView === 'ping') {
                 const box = document.getElementById('xr-unified-log-box');
-                if (box) box.textContent = '(Ping log is empty)';
+                lastLogText = '(Ping log is empty)';
+                if (box) box.textContent = lastLogText;
             }
         });
     };
@@ -7519,9 +7575,6 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
                     }
                     setTimeout(() => { if (st) st.textContent = ''; }, 2500);
                 }
-                if (activeLogView === 'xray' && kind === 'xray') {
-                    setTimeout(xrRefreshActiveLog, 500);
-                }
             } else {
                 if (st) { st.style.color = '#ef5350'; st.textContent = (res && res.error) ? res.error : 'Failed'; }
             }
@@ -7529,6 +7582,15 @@ cat << 'EOF' > /usr/lib/lua/luci/view/xray_service_extra.htm
             if (st) { st.style.color = '#ef5350'; st.textContent = 'Request error: ' + err; }
         });
     };
+
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden && activeLogView) {
+            stopLogPolling();
+            pollActiveLog(logPollSeq, false);
+        }
+    });
+
+    window.addEventListener('beforeunload', stopLogPolling);
 
     function loadServiceExt() {
         fetch('<%=url("admin/services/xray/service_ext")%>')
@@ -7567,7 +7629,7 @@ EOF
 echo "===> Clearing LuCI cache..."
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
-echo "===> Service layout & Logs update completed! Refresh LuCI."
+echo "===> Service layout & Live Logs update completed! Refresh LuCI."
 
 lua /usr/libexec/xray-ui-core.lua generate
 /etc/init.d/xray restart
