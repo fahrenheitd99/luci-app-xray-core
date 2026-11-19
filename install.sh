@@ -9899,4 +9899,474 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
 
 echo "===> Patch v2 completed! Refresh LuCI (Ctrl+F5)."
 
+#!/bin/sh
+set -e
+
+echo "===> Updating /usr/lib/lua/luci/view/xray_rules.htm (Pointer Events drag-and-drop)..."
+cat << 'EOF' > /usr/lib/lua/luci/view/xray_rules.htm
+<style>
+    .xr-rule-disabled td {
+        opacity: 0.45;
+    }
+    .xr-rule-disabled td.xr-rule-drag-cell,
+    .xr-rule-disabled td.xr-rule-chk-cell,
+    .xr-rule-disabled td.xr-rule-act-cell {
+        opacity: 1;
+    }
+    #rules-table-body .xr-drag-handle {
+        touch-action: none;
+        padding: 5px 7px;
+    }
+    #rules-table-body .xr-drag-handle svg {
+        pointer-events: none;
+        display: block;
+    }
+    #rules-table-body tr.xr-row-dragging {
+        opacity: 0.92 !important;
+        background: rgba(79, 195, 247, 0.14) !important;
+        outline: 1px solid rgba(79, 195, 247, 0.55);
+    }
+</style>
+
+<div class="cbi-section xr-card" id="app-rules">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px;">
+        <h3 style="margin:0;">Routing Rules</h3>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <label for="rule-domain-strategy" style="font-size:0.9em; opacity:0.85; margin:0;">Domain Strategy:</label>
+            <select id="rule-domain-strategy" class="cbi-input-select" style="width:165px;" onchange="setDomainStrategy(this.value)">
+                <option value="AsIs">AsIs</option>
+                <option value="IPIfNonMatch">IPIfNonMatch</option>
+                <option value="IPOnDemand">IPOnDemand</option>
+            </select>
+            <span id="rule-ds-status" style="font-size:0.84em;"></span>
+        </div>
+    </div>
+
+    <div class="xr-card" style="margin-bottom:14px;">
+        <h4 id="rule-form-title" style="margin:0 0 10px 0;">New Rule</h4>
+        <div class="xr-sub-grid">
+            <div class="xr-field">
+                <label>Rule Name</label>
+                <input type="text" id="rule-name" class="cbi-input-text" placeholder="e.g. Direct / Proxy">
+            </div>
+            <div class="xr-field">
+                <label>IP (CIDR / geoip:)</label>
+                <input type="text" id="rule-ip" class="cbi-input-text" placeholder="geoip:private, 192.168.0.0/16">
+            </div>
+            <div class="xr-field">
+                <label>Domain (domain / geosite: / regexp:)</label>
+                <input type="text" id="rule-domain" class="cbi-input-text" placeholder="example.com, geosite:private">
+            </div>
+            <div class="xr-field">
+                <label>Protocol</label>
+                <input type="text" id="rule-protocol" class="cbi-input-text" placeholder="bittorrent, http, tls, quic">
+            </div>
+            <div class="xr-field">
+                <label>Network</label>
+                <select id="rule-network" class="cbi-input-select">
+                    <option value="">Any</option>
+                    <option value="tcp">tcp</option>
+                    <option value="udp">udp</option>
+                    <option value="tcp,udp">tcp,udp</option>
+                </select>
+            </div>
+            <div class="xr-field">
+                <label>Port (0-65535)</label>
+                <input type="text" id="rule-port" class="cbi-input-text" placeholder="443 or 80,443 or 1000-2000">
+            </div>
+            <div class="xr-field">
+                <label>Outbound (Node)</label>
+                <select id="rule-outbound" class="cbi-input-select"></select>
+            </div>
+        </div>
+
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <button type="button" id="btn-save-rule" class="cbi-button cbi-button-save" onclick="saveRule()">Add &amp; Save Rule</button>
+            <button type="button" id="btn-cancel-rule" class="cbi-button cbi-button-reset" style="display:none;" onclick="resetRuleForm()">Cancel</button>
+            <span id="rule-status" style="font-size:0.88em; margin-left:6px;"></span>
+        </div>
+    </div>
+
+    <table class="table cbi-section-table" style="width:100%;">
+        <tr class="tr cbi-section-table-titles">
+            <th class="th" style="width:36px; text-align:center;" title="Drag to reorder"></th>
+            <th class="th" style="width:42px; text-align:center;" title="Enable / Disable">On</th>
+            <th class="th" style="width:36px;">#</th>
+            <th class="th" style="width:18%">Name</th>
+            <th class="th">Match Conditions</th>
+            <th class="th" style="width:18%">Outbound</th>
+            <th class="th" style="width:14%; text-align:right;">Actions</th>
+        </tr>
+        <tbody id="rules-table-body"></tbody>
+    </table>
+</div>
+
+<script>
+let editingRuleIdx = -1;
+let activeRuleDrag = null;
+
+function setRuleStatus(text, isError) {
+    const el = document.getElementById('rule-status');
+    if (!el) return;
+    el.style.color = isError ? '#ef5350' : '#66bb6a';
+    el.innerText = text || '';
+}
+
+function setDomainStrategy(val) {
+    if (!db.routing_settings) db.routing_settings = {};
+    db.routing_settings.domainStrategy = val;
+    const st = document.getElementById('rule-ds-status');
+    if (st) { st.style.color = '#4fc3f7'; st.textContent = 'Applying...'; }
+    saveDB(() => {
+        if (st) {
+            st.style.color = '#66bb6a';
+            st.textContent = 'Applied';
+            setTimeout(() => { if (st.textContent === 'Applied') st.textContent = ''; }, 2000);
+        }
+    });
+}
+
+function validatePortField(val) {
+    if (!val) return true;
+    const parts = val.split(',');
+    for (let i = 0; i < parts.length; i++) {
+        const p = parts[i].trim();
+        if (!p) continue;
+        if (/^\d+$/.test(p)) {
+            const n = Number(p);
+            if (n < 0 || n > 65535) return false;
+        } else if (/^\d+-\d+$/.test(p)) {
+            const [a, b] = p.split('-').map(Number);
+            if (a < 0 || b > 65535 || a > b) return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+function populateRuleOutboundSelect(selectedVal) {
+    const sel = document.getElementById('rule-outbound');
+    if (!sel) return;
+    const prev = (selectedVal !== undefined) ? selectedVal : sel.value;
+    sel.innerHTML = '';
+
+    const optDirect = document.createElement('option');
+    optDirect.value = 'direct';
+    optDirect.textContent = 'direct';
+    sel.appendChild(optDirect);
+
+    const optBlock = document.createElement('option');
+    optBlock.value = 'block';
+    optBlock.textContent = 'block';
+    sel.appendChild(optBlock);
+
+    if (Array.isArray(db.nodes) && db.nodes.length > 0) {
+        const grp = document.createElement('optgroup');
+        grp.label = 'Custom Nodes';
+        db.nodes.forEach(n => {
+            if (!n || !n.name) return;
+            const o = document.createElement('option');
+            o.value = n.name;
+            o.textContent = n.name;
+            grp.appendChild(o);
+        });
+        if (grp.children.length > 0) sel.appendChild(grp);
+    }
+
+    if (Array.isArray(db.subs) && db.subs.length > 0) {
+        db.subs.forEach(sub => {
+            if (!sub || !Array.isArray(sub.nodes) || sub.nodes.length === 0) return;
+            const grp = document.createElement('optgroup');
+            grp.label = 'Sub: ' + (sub.name || 'Unnamed');
+            sub.nodes.forEach(n => {
+                if (!n || !n.name) return;
+                const o = document.createElement('option');
+                o.value = n.name;
+                o.textContent = n.name;
+                grp.appendChild(o);
+            });
+            if (grp.children.length > 0) sel.appendChild(grp);
+        });
+    }
+
+    if (prev) {
+        const exists = Array.from(sel.options).some(o => o.value === prev);
+        if (!exists) {
+            const missing = document.createElement('option');
+            missing.value = prev;
+            missing.textContent = prev + ' (not in list)';
+            sel.appendChild(missing);
+        }
+        sel.value = prev;
+    }
+}
+
+function resetRuleForm() {
+    editingRuleIdx = -1;
+    document.getElementById('rule-form-title').innerText = 'New Rule';
+    document.getElementById('btn-save-rule').innerText = 'Add & Save Rule';
+    document.getElementById('btn-cancel-rule').style.display = 'none';
+    document.getElementById('rule-name').value = '';
+    document.getElementById('rule-ip').value = '';
+    document.getElementById('rule-domain').value = '';
+    document.getElementById('rule-protocol').value = '';
+    document.getElementById('rule-network').value = '';
+    document.getElementById('rule-port').value = '';
+    populateRuleOutboundSelect('direct');
+}
+
+function editRule(idx) {
+    const r = db.rules[idx];
+    if (!r) return;
+    editingRuleIdx = idx;
+    document.getElementById('rule-form-title').innerText = 'Edit Rule #' + (idx + 1);
+    document.getElementById('btn-save-rule').innerText = 'Save Changes';
+    document.getElementById('btn-cancel-rule').style.display = '';
+    document.getElementById('rule-name').value = r.name || '';
+    document.getElementById('rule-ip').value = r.ip || '';
+    document.getElementById('rule-domain').value = r.domain || '';
+    document.getElementById('rule-protocol').value = r.protocol || '';
+    document.getElementById('rule-network').value = r.network || '';
+    document.getElementById('rule-port').value = r.port || '';
+    populateRuleOutboundSelect(r.outbound || 'direct');
+    setRuleStatus('Editing rule #' + (idx + 1), false);
+    document.getElementById('rule-name').focus();
+}
+
+function toggleRuleEnabled(idx, checked) {
+    const r = db.rules[idx];
+    if (!r) return;
+    r.enabled = !!checked;
+    setRuleStatus(checked ? `Enabling "${r.name}"...` : `Disabling "${r.name}"...`, false);
+    saveDB(() => {
+        setRuleStatus(checked ? `Rule "${r.name}" enabled.` : `Rule "${r.name}" disabled.`, false);
+    });
+}
+
+function saveRule() {
+    const name = document.getElementById('rule-name').value.trim();
+    const ip = document.getElementById('rule-ip').value.trim();
+    const domain = document.getElementById('rule-domain').value.trim();
+    const protocol = document.getElementById('rule-protocol').value.trim();
+    const network = document.getElementById('rule-network').value.trim();
+    const port = document.getElementById('rule-port').value.trim();
+    const outbound = document.getElementById('rule-outbound').value;
+
+    if (!ip && !domain && !protocol && !network && !port) {
+        setRuleStatus('Fill at least one condition (IP, Domain, Protocol, Network, or Port).', true);
+        return;
+    }
+    if (!validatePortField(port)) {
+        setRuleStatus('Invalid port. Use 0-65535 (single, comma-separated, or range a-b).', true);
+        return;
+    }
+    if (!outbound) {
+        setRuleStatus('Select an outbound node.', true);
+        return;
+    }
+
+    if (!Array.isArray(db.rules)) db.rules = [];
+    const wasEditing = (editingRuleIdx >= 0 && editingRuleIdx < db.rules.length);
+    const keepEnabled = wasEditing ? (db.rules[editingRuleIdx].enabled !== false) : true;
+
+    const ruleObj = {
+        enabled: keepEnabled,
+        name: name || ('Rule #' + (wasEditing ? editingRuleIdx + 1 : (db.rules.length + 1))),
+        ip: ip,
+        domain: domain,
+        protocol: protocol,
+        network: network,
+        port: port,
+        outbound: outbound
+    };
+
+    if (wasEditing) {
+        db.rules[editingRuleIdx] = ruleObj;
+    } else {
+        db.rules.push(ruleObj);
+    }
+
+    resetRuleForm();
+    setRuleStatus('Saving & applying config...', false);
+    saveDB(() => {
+        setRuleStatus(wasEditing ? `Rule "${ruleObj.name}" updated.` : `Rule "${ruleObj.name}" added & applied.`, false);
+    });
+}
+
+function deleteRule(idx) {
+    const r = db.rules[idx];
+    if (!r) return;
+    if (editingRuleIdx === idx) resetRuleForm();
+    else if (editingRuleIdx > idx) editingRuleIdx -= 1;
+
+    db.rules.splice(idx, 1);
+    setRuleStatus('Applying changes...', false);
+    saveDB(() => {
+        setRuleStatus(`Rule "${r.name}" removed.`, false);
+    });
+}
+
+function formatRuleMatchChips(r) {
+    const chips = [];
+    if (r.domain) chips.push(`<span class="xr-chip">domain: ${escapeHtml(r.domain)}</span>`);
+    if (r.ip) chips.push(`<span class="xr-chip">ip: ${escapeHtml(r.ip)}</span>`);
+    if (r.protocol) chips.push(`<span class="xr-chip">proto: ${escapeHtml(r.protocol)}</span>`);
+    if (r.network) chips.push(`<span class="xr-chip">net: ${escapeHtml(r.network)}</span>`);
+    if (r.port) chips.push(`<span class="xr-chip">port: ${escapeHtml(r.port)}</span>`);
+    return chips.length > 0 ? chips.join('') : '<em>-</em>';
+}
+
+function updateRuleRowNumbers(tbody) {
+    if (!tbody) return;
+    const rows = tbody.querySelectorAll('tr.xr-rule-row');
+    rows.forEach((row, i) => {
+        const numEl = row.querySelector('.xr-rule-num');
+        if (numEl) numEl.textContent = String(i + 1);
+    });
+}
+
+function onRuleDragMove(e) {
+    if (!activeRuleDrag) return;
+    e.preventDefault();
+    const { tr, tbody } = activeRuleDrag;
+    const y = e.clientY;
+    const siblings = Array.from(tbody.querySelectorAll('tr.xr-rule-row')).filter(row => row !== tr);
+
+    let insertBeforeEl = null;
+    for (let i = 0; i < siblings.length; i++) {
+        const rect = siblings[i].getBoundingClientRect();
+        if (y < rect.top + rect.height / 2) {
+            insertBeforeEl = siblings[i];
+            break;
+        }
+    }
+
+    if (insertBeforeEl !== tr.nextSibling) {
+        tbody.insertBefore(tr, insertBeforeEl);
+        updateRuleRowNumbers(tbody);
+    }
+}
+
+function onRuleDragEnd() {
+    if (!activeRuleDrag) return;
+    const { tr, tbody, startIdx } = activeRuleDrag;
+    activeRuleDrag = null;
+
+    window.removeEventListener('pointermove', onRuleDragMove);
+    window.removeEventListener('pointerup', onRuleDragEnd);
+    window.removeEventListener('pointercancel', onRuleDragEnd);
+
+    tr.classList.remove('xr-row-dragging');
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+
+    const rows = Array.from(tbody.querySelectorAll('tr.xr-rule-row'));
+    const finalIdx = rows.indexOf(tr);
+    if (finalIdx !== -1 && finalIdx !== startIdx) {
+        const moved = db.rules.splice(startIdx, 1)[0];
+        db.rules.splice(finalIdx, 0, moved);
+        if (editingRuleIdx !== -1) resetRuleForm();
+        setRuleStatus('Updating rule order...', false);
+        saveDB(() => setRuleStatus('Rule order saved.', false));
+    }
+}
+
+function startRuleDrag(e, tr, tbody) {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (!Array.isArray(db.rules) || db.rules.length < 2) return;
+    e.preventDefault();
+
+    const rows = Array.from(tbody.querySelectorAll('tr.xr-rule-row'));
+    const startIdx = rows.indexOf(tr);
+    if (startIdx === -1) return;
+
+    activeRuleDrag = { tr: tr, tbody: tbody, startIdx: startIdx };
+    tr.classList.add('xr-row-dragging');
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'grabbing';
+
+    window.addEventListener('pointermove', onRuleDragMove, { passive: false });
+    window.addEventListener('pointerup', onRuleDragEnd);
+    window.addEventListener('pointercancel', onRuleDragEnd);
+}
+
+function renderRules() {
+    if (activeRuleDrag) onRuleDragEnd();
+
+    const dsSel = document.getElementById('rule-domain-strategy');
+    if (dsSel && db.routing_settings && db.routing_settings.domainStrategy) {
+        dsSel.value = db.routing_settings.domainStrategy;
+    }
+
+    populateRuleOutboundSelect();
+    const tbody = document.getElementById('rules-table-body');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    if (!Array.isArray(db.rules) || db.rules.length === 0) {
+        tbody.innerHTML = '<tr class="tr"><td class="td" colspan="7"><em>No routing rules configured. Add a rule above.</em></td></tr>';
+        return;
+    }
+
+    db.rules.forEach((r, idx) => {
+        const isEnabled = (r.enabled !== false);
+        const outBadgeClass = (r.outbound === 'block') ? 'xr-badge-stop'
+            : (r.outbound === 'direct' ? 'xr-badge-idle' : 'xr-badge-run');
+
+        const tr = document.createElement('tr');
+        tr.className = 'tr cbi-section-table-row xr-rule-row' + (isEnabled ? '' : ' xr-rule-disabled');
+        tr._ruleRef = r;
+
+        tr.innerHTML = `
+            <td class="td xr-rule-drag-cell" style="text-align:center; vertical-align:middle;">
+                <span class="xr-drag-handle" title="Drag to reorder">
+                    <svg width="12" height="16" viewBox="0 0 12 16" fill="currentColor">
+                        <circle cx="3" cy="3" r="1.4"/><circle cx="9" cy="3" r="1.4"/>
+                        <circle cx="3" cy="8" r="1.4"/><circle cx="9" cy="8" r="1.4"/>
+                        <circle cx="3" cy="13" r="1.4"/><circle cx="9" cy="13" r="1.4"/>
+                    </svg>
+                </span>
+            </td>
+            <td class="td xr-rule-chk-cell" style="text-align:center; vertical-align:middle;">
+                <input type="checkbox" class="xr-rule-chk" ${isEnabled ? 'checked' : ''} title="${isEnabled ? 'Disable rule' : 'Enable rule'}">
+            </td>
+            <td class="td"><code class="xr-rule-num">${idx + 1}</code></td>
+            <td class="td"><strong>${escapeHtml(r.name || ('Rule #' + (idx + 1)))}</strong></td>
+            <td class="td">${formatRuleMatchChips(r)}</td>
+            <td class="td"><span class="xr-badge ${outBadgeClass}">${escapeHtml(r.outbound || 'direct')}</span></td>
+            <td class="td xr-rule-act-cell" style="text-align:right; white-space:nowrap;">
+                <button type="button" class="cbi-button cbi-button-action xr-rule-edit">Edit</button>
+                <button type="button" class="cbi-button cbi-button-remove xr-rule-del">Delete</button>
+            </td>
+        `;
+
+        const handle = tr.querySelector('.xr-drag-handle');
+        handle.ondragstart = () => false;
+        handle.addEventListener('pointerdown', (e) => startRuleDrag(e, tr, tbody));
+
+        tr.querySelector('.xr-rule-chk').addEventListener('change', (e) => {
+            const curIdx = db.rules.indexOf(r);
+            if (curIdx !== -1) toggleRuleEnabled(curIdx, e.target.checked);
+        });
+        tr.querySelector('.xr-rule-edit').addEventListener('click', () => {
+            const curIdx = db.rules.indexOf(r);
+            if (curIdx !== -1) editRule(curIdx);
+        });
+        tr.querySelector('.xr-rule-del').addEventListener('click', () => {
+            const curIdx = db.rules.indexOf(r);
+            if (curIdx !== -1) deleteRule(curIdx);
+        });
+
+        tbody.appendChild(tr);
+    });
+}
+</script>
+EOF
+
+echo "===> Clearing LuCI cache..."
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ /tmp/luci-uci-cache
+
+echo "===> Rules drag-and-drop fix completed! Refresh LuCI (Ctrl+F5)."
+
 echo "===> Setup completed! Refresh your LuCI web interface."
